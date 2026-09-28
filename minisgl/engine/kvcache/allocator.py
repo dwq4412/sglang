@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
+
 if TYPE_CHECKING:
     import torch
 
@@ -85,13 +87,20 @@ class KVCacheAllocator:
         from minisgl.utils.logger import logger
 
         ma = self.model_args
-        # Match the attention modules: replicate KV heads when num_kv_heads
-        # is not divisible by tp_size (never allocate a 0-head buffer).
-        num_kv_heads_per_rank = max(1, ma.num_kv_heads // tp_size)
+        num_kv_heads_per_rank = ma.num_kv_heads // tp_size
         dtype = model.lm_head.weight.dtype
 
         available = self.available_memory(device)
         num_pages = self.num_pages(available, num_kv_heads_per_rank, dtype.itemsize)
+        if tp_size > 1:
+            from minisgl.engine.collectives import all_reduce
+
+            # Every rank must expose the same logical page IDs to the radix
+            # cache. Use the smallest local capacity when GPU free memory
+            # differs across devices.
+            num_pages = int(all_reduce(
+                torch.tensor(num_pages, device=device, dtype=torch.int64), op="min"
+            ).item())
         logger.info("Allocating KV cache: %d pages", num_pages)
 
         pool = KVCachePool(

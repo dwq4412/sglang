@@ -137,13 +137,14 @@ def default_server_args(
 
 
 def build_engine(model_path: str, **overrides: object) -> tuple[ServerArgs, Engine]:
-    """Create ServerArgs + a single-GPU Engine for a model path."""
+    """Create ServerArgs + an engine/runtime for a model path."""
     from minisgl.config import ModelArgs
-    from minisgl.engine.engine import Engine
+    from minisgl.engine.distributed import create_scheduler_runtime
 
     args = default_server_args(model_path, **overrides)
     model_args = ModelArgs.from_pretrained(model_path)
-    return args, Engine(args, model_args, tp_rank=0)
+    _scheduler, runtime = create_scheduler_runtime(args, model_args)
+    return args, runtime
 
 
 def load_tokenizer(model_path: str, *, trust_remote_code: bool = False):

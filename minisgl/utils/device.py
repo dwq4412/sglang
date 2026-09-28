@@ -10,13 +10,16 @@ __all__ = [
     "get_device_type",
     "get_tp_rank",
     "get_tp_size",
+    "get_tp_group",
     "init_distributed",
     "is_accelerator_available",
     "is_distributed",
     "is_npu_available",
+    "mem_get_info",
     "reset_device_state",
     "set_device",
     "synchronize",
+    "barrier",
 ]
 import os
 from dataclasses import dataclass
@@ -64,6 +67,7 @@ class DeviceState:
     tp_rank: int = 0
     tp_size: int = 1
     device: torch.device | None = None
+    tp_group: object | None = None
 
 
 _state = DeviceState()
@@ -85,13 +89,40 @@ def get_tp_size() -> int:
     return _state.tp_size
 
 
+def get_tp_group():
+    """Return the explicit tensor-parallel process group, if initialized."""
+    return _state.tp_group
+
+
 def get_device() -> torch.device:
     if _state.device is None:
-        _state.device = torch.device(get_device_type())
+        device_type = get_device_type()
+        if device_type == "cuda":
+            # Several CUDA APIs, including mem_get_info, require an explicit
+            # device index.  ``torch.device("cuda")`` is valid for tensor
+            # placement but is not accepted by all runtime APIs.
+            _state.device = torch.device("cuda", torch.cuda.current_device())
+        elif device_type == "npu":
+            # Keep NPU behavior consistent with CUDA when the backend exposes
+            # current_device().  Older torch_npu versions may not, so retain
+            # the type-only device as a fallback.
+            current_device = getattr(torch.npu, "current_device", None)
+            if current_device is None:
+                _state.device = torch.device("npu")
+            else:
+                _state.device = torch.device("npu", current_device())
+        else:
+            _state.device = torch.device(device_type)
     return _state.device
 
 
 def set_device(device: torch.device) -> None:
+    if device.type == "cuda" and device.index is None:
+        device = torch.device("cuda", torch.cuda.current_device())
+    elif device.type == "npu" and device.index is None:
+        current_device = getattr(torch.npu, "current_device", None)
+        if current_device is not None:
+            device = torch.device("npu", current_device())
     _state.device = device
     if device.type == "cuda":
         torch.cuda.set_device(device)
@@ -135,6 +166,10 @@ def init_distributed(
 
     Auto-selects backend: 'hccl' for NPU, 'nccl' for CUDA, 'gloo' for CPU.
     """
+    if tp_size < 1:
+        raise ValueError("tp_size must be positive")
+    if not 0 <= tp_rank < tp_size:
+        raise ValueError(f"tp_rank={tp_rank} outside tp_size={tp_size}")
     _state.tp_rank = tp_rank
     _state.tp_size = tp_size
 
@@ -150,14 +185,25 @@ def init_distributed(
 
         os.environ.setdefault("MASTER_ADDR", master_addr)
         os.environ.setdefault("MASTER_PORT", str(master_port))
+        local_rank = int(os.environ.get("LOCAL_RANK", tp_rank))
+        dev_type = get_device_type()
+        if dev_type == "cuda":
+            set_device(torch.device("cuda", local_rank))
+        elif dev_type == "npu":
+            set_device(torch.device("npu", local_rank))
         dist.init_process_group(
             backend=backend,
-            rank=tp_rank,
-            world_size=tp_size,
+            init_method="env://",
+            rank=int(os.environ.get("RANK", tp_rank)),
+            world_size=int(os.environ.get("WORLD_SIZE", tp_size)),
         )
-        dev_type = get_device_type()
-        device = torch.device(f"{dev_type}:{tp_rank}")
-        set_device(device)
+        _state.tp_group = dist.new_group(ranks=list(range(tp_size)))
+
+
+def barrier() -> None:
+    """Synchronize TP workers; a no-op in single-process mode."""
+    if is_distributed():
+        dist.barrier(group=_state.tp_group)
 
 
 def is_distributed() -> bool:

@@ -7,6 +7,7 @@ import logging
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
@@ -448,6 +449,19 @@ class TestDeviceUtils(unittest.TestCase):
         self.assertEqual(free, 0)
         self.assertEqual(total, 0)
 
+    def test_get_device_cuda_has_explicit_index(self):
+        from minisgl.utils.device import get_device, reset_device_state
+
+        reset_device_state()
+        with patch("minisgl.utils.device.is_npu_available", return_value=False), patch(
+            "minisgl.utils.device.torch.cuda.is_available", return_value=True
+        ), patch(
+            "minisgl.utils.device.torch.cuda.current_device", return_value=2
+        ):
+            device = get_device()
+        self.assertEqual(device, torch.device("cuda:2"))
+        reset_device_state()
+
     def test_set_device_cpu(self):
         from minisgl.utils.device import get_device, reset_device_state, set_device
 
@@ -566,16 +580,16 @@ class TestCLIArgs(unittest.TestCase):
         self.assertEqual(args.page_size, 8)
         self.assertTrue(args.shell)
 
-    def test_parse_args_rejects_tp_size_gt_1(self):
+    def test_parse_args_accepts_tensor_parallel_size(self):
         from minisgl.cli import parse_args
 
         old_argv = sys.argv
         sys.argv = ["minisgl", "--model-path", "/m/model", "--tp-size", "2"]
         try:
-            with self.assertRaises(SystemExit):
-                parse_args()
+            args = parse_args()
         finally:
             sys.argv = old_argv
+        self.assertEqual(args.tp_size, 2)
 
     def test_parse_args_rejects_invalid_backend(self):
         from minisgl.cli import parse_args

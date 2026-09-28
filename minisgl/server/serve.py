@@ -21,8 +21,7 @@ def serve(args: ServerArgs) -> None:
     import uvicorn
 
     from minisgl.config import ModelArgs
-    from minisgl.engine.engine import Engine
-    from minisgl.scheduler.scheduler import Scheduler
+    from minisgl.engine.distributed import create_scheduler_runtime
     from minisgl.server.api import app, init_frontend
     from minisgl.tokenizer import TokenizerWorker
     from minisgl.utils.logger import setup_logger
@@ -35,9 +34,11 @@ def serve(args: ServerArgs) -> None:
         args.model_path, trust_remote_code=args.trust_remote_code
     )
 
-    engine = Engine(args, model_args, tp_rank=0)
-    scheduler = Scheduler(args, engine)
+    scheduler, runtime = create_scheduler_runtime(args, model_args)
 
     init_frontend(args, scheduler, tokenizer)
 
-    uvicorn.run(app, host=args.host, port=args.port, log_level=log_level.lower())
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level=log_level.lower())
+    finally:
+        runtime.cleanup()

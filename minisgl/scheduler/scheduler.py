@@ -168,11 +168,17 @@ class Scheduler:
                 return {int(x) for x in token_id if x is not None}
         return set()
 
-    def add_request(self, input_ids: list[int], sampling_params: SamplingParams) -> int:
+    def add_request(
+        self,
+        input_ids: list[int],
+        sampling_params: SamplingParams,
+        uid: int | None = None,
+    ) -> int:
         """Add a new request and return its UID."""
         with self._lock:
-            uid = self._uid_counter
-            self._uid_counter += 1
+            if uid is None:
+                uid = self._uid_counter
+            self._uid_counter = max(self._uid_counter, uid + 1)
 
             if len(input_ids) > self.args.max_seq_len:
                 logger.warning(

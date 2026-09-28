@@ -20,6 +20,7 @@ from minisgl.sampling import Sampler
 from minisgl.utils.device import (
     get_device,
     get_device_type,
+    get_tp_rank,
     init_distributed,
     synchronize,
 )
@@ -45,10 +46,15 @@ class Engine:
         self.model_args = model_args
         self.tp_rank = tp_rank
         self.tp_size = server_args.tp_size
-        self.device = get_device()
+        if self.tp_size > 1 and server_args.cuda_graph_bs:
+            raise ValueError("CUDA graphs are not supported with tp_size > 1 yet")
         self._device_type = get_device_type()
 
         self._maybe_init_distributed(model_args)
+        # Distributed initialization selects the local CUDA/NPU device. Do not
+        # cache a device before that point: spawned workers would otherwise all
+        # construct their model on device 0.
+        self.device = get_device()
         AttentionBackend.configure(server_args.attention_backend)
         self._clamp_max_seq_len(model_args)
         self._validate_model_path(server_args.model_path)
@@ -83,7 +89,18 @@ class Engine:
         self.runner = model_runner.ModelRunner(model, server_args, self.device)
         self.model = model  # public alias kept for tests / GraphRunner coupling
         self.batch_context = self.runner.batch_context
-        self.graph_runner = self.runner.graph_runner
+        # GraphRunner is Engine-owned: it needs the KV cache pool and Engine's
+        # execution/device aliases, all of which are ready only at this point.
+        self.graph_runner = None
+        if (
+            server_args.cuda_graph_bs
+            and server_args.cuda_graph_bs > 0
+            and self.device.type in ("cuda", "npu")
+        ):
+            from minisgl.engine.graph import GraphRunner
+
+            self.graph_runner = GraphRunner(self)
+            self.runner.graph_runner = self.graph_runner
 
         self.sampler = Sampler()
 
@@ -95,16 +112,22 @@ class Engine:
         """Initialize the process group when tensor parallelism is requested."""
         if self.tp_size <= 1:
             return
+        if not 2 <= self.tp_size <= 8:
+            raise ValueError("tp_size must be between 1 and 8")
         init_distributed(tp_rank=self.tp_rank, tp_size=self.tp_size)
-        if model_args.num_kv_heads % self.tp_size != 0:
-            # Teaching simplification: KV heads are not truly divisible, so
-            # ranks replicate heads (max(1, ...) in each attention module and
-            # the KV pool) instead of erroring out.
-            logger.warning(
-                "num_kv_heads=%d not divisible by tp_size=%d; KV heads will "
-                "be replicated across ranks (no exact sharding)",
-                model_args.num_kv_heads,
-                self.tp_size,
+        dimensions = {
+            "num_attention_heads": model_args.num_attention_heads,
+            "num_kv_heads": model_args.num_kv_heads,
+            "intermediate_size": model_args.intermediate_size,
+            "vocab_size": model_args.vocab_size,
+        }
+        if model_args.num_experts:
+            raise ValueError("Qwen3-MoE tensor parallelism is not supported yet")
+        invalid = [name for name, value in dimensions.items() if value % self.tp_size]
+        if invalid:
+            raise ValueError(
+                f"Model dimensions must be divisible by tp_size={self.tp_size}: "
+                + ", ".join(invalid)
             )
 
     def _clamp_max_seq_len(self, model_args: ModelArgs) -> None:
@@ -213,4 +236,17 @@ class Engine:
             logits = logits.unsqueeze(0)  # (1, vocab_size)
 
         params = [req.sampling_params for req in batch.reqs]
-        return self.sampler.sample_batch(logits, params)
+        if self.tp_size <= 1:
+            return self.sampler.sample_batch(logits, params)
+
+        # Sampling is a control-plane operation. Only rank 0 consumes random
+        # state; every rank receives exactly the same token IDs before the
+        # scheduler mutates request/KV state.
+        tokens = self.sampler.sample_batch(logits, params) if get_tp_rank() == 0 else None
+        token_tensor = torch.empty(len(batch.reqs), dtype=torch.long, device=self.device)
+        if tokens is not None:
+            token_tensor.copy_(torch.tensor(tokens, dtype=torch.long, device=self.device))
+        from minisgl.engine.collectives import broadcast
+
+        broadcast(token_tensor, src=0)
+        return token_tensor.tolist()

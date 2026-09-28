@@ -88,11 +88,10 @@ def parse_args() -> ServerArgs:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
     parsed = parser.parse_args()
-    if parsed.tp_size > 1:
-        parser.error(
-            "tp_size > 1 is not supported yet: multi-process TP launch "
-            "has not been implemented"
-        )
+    if parsed.tp_size < 1 or parsed.tp_size > 8:
+        parser.error("tp_size must be between 1 and 8")
+    if parsed.tp_size > 1 and parsed.cuda_graph_bs:
+        parser.error("--cuda-graph-bs must be 0 when --tp-size is greater than 1")
     return ServerArgs(**vars(parsed))
 
 

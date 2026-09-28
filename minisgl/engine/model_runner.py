@@ -24,6 +24,7 @@ if TYPE_CHECKING:
     import torch.nn as nn
 
     from minisgl.config import ModelArgs, ServerArgs
+    from minisgl.engine.graph import GraphRunner
     from minisgl.models.attention.metadata import AttentionMetadata
     from minisgl.scheduler.batch import Batch
 
@@ -170,16 +171,10 @@ class ModelRunner:
             device,
         )
 
-        # Decode acceleration: capture CUDA/NPU graphs for the decode path.
-        from minisgl.engine.graph import GraphRunner
-
+        # Graph capture is initialized by Engine after the KV cache pool and
+        # the Engine-level compatibility aliases are ready. GraphRunner needs
+        # those Engine-owned resources, so it cannot be created here.
         self.graph_runner: GraphRunner | None = None
-        if (
-            server_args.cuda_graph_bs
-            and server_args.cuda_graph_bs > 0
-            and device.type in ("cuda", "npu")
-        ):
-            self.graph_runner = GraphRunner(self)
 
     def _run_model(
         self,

@@ -11,8 +11,7 @@ import contextlib
 import time
 
 from minisgl.config import ModelArgs, SamplingParams, ServerArgs
-from minisgl.engine.engine import Engine
-from minisgl.scheduler.scheduler import Scheduler
+from minisgl.engine.distributed import create_scheduler_runtime
 from minisgl.tokenizer import TokenizerWorker
 from minisgl.utils.logger import logger
 
@@ -48,8 +47,7 @@ class LLM:
         model_args = ModelArgs.from_pretrained(model_path)
 
         logger.info("Loading model from %s", model_path)
-        self.engine = Engine(server_args, model_args, tp_rank=0)
-        self.scheduler = Scheduler(server_args, self.engine)
+        self.scheduler, self.engine = create_scheduler_runtime(server_args, model_args)
         self.tokenizer = TokenizerWorker(
             model_path, trust_remote_code=trust_remote_code
         )
