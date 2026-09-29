@@ -82,36 +82,24 @@ class RowParallelLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if is_distributed():
-            from minisgl.engine.collectives import all_reduce_chunks
+            from minisgl.engine.collectives import all_reduce_chunks, get_ar_chunk_rows
 
             flat_x = x.reshape(-1, x.shape[-1])
-            payload = flat_x.shape[0] * self.out_features * flat_x.element_size()
-            from minisgl.engine import collectives
-
-            chunk_bytes = collectives._ar_chunk_bytes
-            if (
-                collectives._mode == "adaptive"
-                and chunk_bytes > 0
-                and payload > chunk_bytes
-                and self.weight.device.type == "cuda"
-            ):
-                rows_per_chunk = max(
-                    1,
-                    chunk_bytes // (self.out_features * flat_x.element_size()),
-                    (flat_x.shape[0] + 3) // 4,
+            rows_per_chunk = (
+                get_ar_chunk_rows(
+                    flat_x.shape[0], self.out_features, flat_x.element_size()
                 )
-                chunks = [
+                if self.weight.device.type == "cuda"
+                else None
+            )
+            if rows_per_chunk is not None:
+                chunks = (
                     F.linear(flat_x[start : start + rows_per_chunk], self.weight)
                     for start in range(0, flat_x.shape[0], rows_per_chunk)
-                ]
-                if len(chunks) > 1:
-                    out = torch.cat(all_reduce_chunks(chunks), dim=0).reshape(
-                        *x.shape[:-1], self.out_features
-                    )
-                else:
-                    out = all_reduce_chunks(chunks)[0].reshape(
-                        *x.shape[:-1], self.out_features
-                    )
+                )
+                out = torch.cat(all_reduce_chunks(chunks), dim=0).reshape(
+                    *x.shape[:-1], self.out_features
+                )
             else:
                 out = F.linear(x, self.weight)
                 from minisgl.engine.collectives import all_reduce

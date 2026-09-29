@@ -8,6 +8,7 @@ workers.  This keeps notebook state out of the inference process.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +48,7 @@ def run_benchmark(
     dtype: str = "float16",
     cache_strategy: str = "naive",
     page_size: int = 16,
+    max_seq_len: int | None = None,
     batch_size: int = 1,
     input_len: int = 128,
     output_len: int = 20,
@@ -65,12 +67,24 @@ def run_benchmark(
 
     keep_output = output_path is not None
     if output_path is None:
-        temporary = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
-        output = Path(temporary.name)
-        temporary.close()
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as temporary:
+            output = Path(temporary.name)
     else:
         output = Path(output_path)
         output.parent.mkdir(parents=True, exist_ok=True)
+
+    # torchrun inherits the notebook environment.  Some hosted environments
+    # export an empty/non-numeric OMP_NUM_THREADS, which libgomp rejects.
+    environment = None
+    omp_threads = os.environ.get("OMP_NUM_THREADS")
+    if omp_threads is not None:
+        try:
+            valid_omp = int(omp_threads) > 0
+        except ValueError:
+            valid_omp = False
+        if not valid_omp:
+            environment = os.environ.copy()
+            environment["OMP_NUM_THREADS"] = "1"
 
     command = [
         sys.executable,
@@ -96,6 +110,8 @@ def run_benchmark(
         str(tp_ar_chunk_bytes),
         "--page-size",
         str(page_size),
+        "--max-seq-len",
+        str(max_seq_len or input_len + output_len + 32),
         "--batch-size",
         str(batch_size),
         "--input-len",
@@ -113,7 +129,10 @@ def run_benchmark(
         command.append("--collective-stats")
 
     try:
-        subprocess.run(command, cwd=ROOT, check=True)
+        if environment is None:
+            subprocess.run(command, cwd=ROOT, check=True)
+        else:
+            subprocess.run(command, cwd=ROOT, check=True, env=environment)
         data = json.loads(output.read_text(encoding="utf-8"))
         if isinstance(data, list):
             if len(data) != 1:

@@ -9,7 +9,7 @@ __all__ = [
     "all_gather",
     "all_reduce",
     "all_reduce_chunks",
-    "all_reduce_chunked",
+    "get_ar_chunk_rows",
     "broadcast",
     "barrier",
     "configure",
@@ -17,6 +17,7 @@ __all__ = [
     "reset_stats",
 ]
 import time
+from collections.abc import Iterable
 
 import torch
 import torch.distributed as dist
@@ -88,83 +89,47 @@ def all_reduce(tensor: torch.Tensor, op: str = "sum", group=None) -> torch.Tenso
     return tensor
 
 
-def all_reduce_chunked(tensor: torch.Tensor, group=None) -> torch.Tensor:
-    """Reduce a large tensor in a few async chunks, otherwise use the baseline."""
-    if not is_distributed() or _mode != "adaptive" or _ar_chunk_bytes <= 0:
-        return all_reduce(tensor, group=group)
-    flat = tensor.reshape(-1)
-    chunk_elems = max(1, _ar_chunk_bytes // tensor.element_size())
-    chunks = min(4, (flat.numel() + chunk_elems - 1) // chunk_elems)
-    if chunks <= 1 or not hasattr(dist, "all_reduce"):
-        return all_reduce(tensor, group=group)
-    group = group if group is not None else get_tp_group()
-    works = []
-    original = tensor.clone()
-    start = time.perf_counter() if _stats_enabled else 0
-    for chunk in flat.tensor_split(chunks):
-        try:
-            works.append(
-                dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
-            )
-        except (TypeError, RuntimeError):
-            for work in works:
-                if hasattr(work, "wait"):
-                    work.wait()
-            tensor.copy_(original)
-            return all_reduce(tensor, group=group)
-    try:
-        for work in works:
-            work.wait()
-    except (AttributeError, RuntimeError):
-        tensor.copy_(original)
-        return all_reduce(tensor, group=group)
-    _record(
-        "all_reduce",
-        tensor.numel() * tensor.element_size(),
-        time.perf_counter() - start if start else 0,
-    )
-    return tensor
+def get_ar_chunk_rows(
+    num_rows: int, out_features: int, element_size: int
+) -> int | None:
+    """Return an adaptive AllReduce chunk size, or ``None`` when disabled."""
+    row_bytes = out_features * element_size
+    if (
+        _mode != "adaptive"
+        or _ar_chunk_bytes <= 0
+        or num_rows * row_bytes <= _ar_chunk_bytes
+    ):
+        return None
+    return max(1, _ar_chunk_bytes // row_bytes, (num_rows + 3) // 4)
 
 
-def all_reduce_chunks(chunks: list[torch.Tensor], group=None) -> list[torch.Tensor]:
-    """Asynchronously reduce precomputed output chunks when supported.
-
-    The caller owns the GEMM scheduling; this helper only decides whether the
-    async collective path is safe and waits for every outstanding operation.
-    """
-    if not chunks:
-        return chunks
+def all_reduce_chunks(chunks: Iterable[torch.Tensor], group=None) -> list[torch.Tensor]:
+    """Reduce chunks while submitting each NCCL operation as it is produced."""
     if not is_distributed() or _mode != "adaptive" or _ar_chunk_bytes <= 0:
         return [all_reduce(chunk, group=group) for chunk in chunks]
     try:
         backend = dist.get_backend(group if group is not None else get_tp_group())
     except (AttributeError, RuntimeError):
         backend = "unknown"
-    if backend != "nccl" or len(chunks) <= 1:
+    if backend != "nccl":
         return [all_reduce(chunk, group=group) for chunk in chunks]
     group = group if group is not None else get_tp_group()
     works = []
-    originals = [chunk.clone() for chunk in chunks]
+    reduced = []
     start = time.perf_counter() if _stats_enabled else 0
-    try:
-        for chunk in chunks:
-            works.append(
-                dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
-            )
-        for work in works:
-            work.wait()
-    except (AttributeError, RuntimeError, TypeError):
-        # A backend may expose async_op but not implement it for this tensor.
-        for work in works:
-            if hasattr(work, "wait"):
-                work.wait()
-        return [all_reduce(original, group=group) for original in originals]
+    for chunk in chunks:
+        works.append(
+            dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
+        )
+        reduced.append(chunk)
+    for work in works:
+        work.wait()
     _record(
         "all_reduce",
-        sum(chunk.numel() * chunk.element_size() for chunk in chunks),
+        sum(chunk.numel() * chunk.element_size() for chunk in reduced),
         time.perf_counter() - start if start else 0,
     )
-    return chunks
+    return reduced
 
 
 def all_gather(tensor: torch.Tensor, dim: int = -1, group=None) -> torch.Tensor:

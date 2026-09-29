@@ -233,6 +233,62 @@ class TestDistributed(unittest.TestCase):
         self.assertEqual(mocked_reduce.call_count, 2)
         collectives.configure("legacy")
 
+    def test_all_reduce_chunks_submits_lazy_chunks_in_order(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        events = []
+
+        class Work:
+            def __init__(self, index):
+                self.index = index
+
+            def wait(self):
+                events.append(f"wait{self.index}")
+
+        def fake_reduce(tensor, **kwargs):
+            events.append(f"reduce{int(tensor[0])}")
+            return Work(int(tensor[0]))
+
+        def chunks():
+            for value in range(3):
+                events.append(f"make{value}")
+                yield torch.tensor([value])
+
+        with mock.patch.object(
+            collectives, "is_distributed", return_value=True
+        ), mock.patch.object(
+            collectives.dist, "get_backend", return_value="nccl"
+        ), mock.patch.object(collectives.dist, "all_reduce", side_effect=fake_reduce):
+            collectives.configure("adaptive", ar_chunk_bytes=1)
+            result = collectives.all_reduce_chunks(chunks())
+
+        self.assertEqual([int(chunk[0]) for chunk in result], [0, 1, 2])
+        self.assertEqual(
+            events,
+            [
+                "make0",
+                "reduce0",
+                "make1",
+                "reduce1",
+                "make2",
+                "reduce2",
+                "wait0",
+                "wait1",
+                "wait2",
+            ],
+        )
+        collectives.configure("legacy")
+
+    def test_adaptive_chunk_rows_are_bounded_to_four_chunks(self):
+        import minisgl.engine.collectives as collectives
+
+        collectives.configure("adaptive", ar_chunk_bytes=16)
+        self.assertEqual(collectives.get_ar_chunk_rows(100, 4, 4), 25)
+        self.assertIsNone(collectives.get_ar_chunk_rows(1, 4, 4))
+        collectives.configure("legacy")
+
     def test_invalid_communication_mode_raises(self):
         from minisgl.config import ServerArgs
 
