@@ -190,6 +190,49 @@ class TestDistributed(unittest.TestCase):
         self.assertIsNot(outputs[0], outputs[1])
         collectives.configure("legacy")
 
+    def test_all_gather_adaptive_evicts_oldest_workspace_after_eight(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        outputs = []
+
+        def fake_into(output, input_tensor, **kwargs):
+            outputs.append(output)
+            output.copy_(input_tensor.repeat(2, *([1] * (input_tensor.dim() - 1))))
+
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives, "get_tp_size", return_value=2
+        ), mock.patch.object(collectives.dist, "all_gather_into_tensor", side_effect=fake_into):
+            collectives.configure("adaptive")
+            for rows in range(1, 9):
+                collectives.all_gather(torch.arange(rows * 2).reshape(rows, 2))
+            first = outputs[0]
+            collectives.all_gather(torch.arange(18).reshape(9, 2))
+            collectives.all_gather(torch.arange(2).reshape(1, 2))
+
+        self.assertEqual(len(collectives._gather_workspaces), 8)
+        self.assertIsNot(outputs[-1], first)
+        collectives.configure("legacy")
+
+    def test_all_reduce_chunks_falls_back_for_non_nccl(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        chunks = [torch.ones(2), torch.ones(2)]
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives.dist, "get_backend", return_value="gloo"
+        ), mock.patch.object(
+            collectives, "all_reduce", side_effect=lambda tensor, **_: tensor
+        ) as mocked_reduce:
+            collectives.configure("adaptive", ar_chunk_bytes=1)
+            result = collectives.all_reduce_chunks(chunks)
+
+        self.assertEqual(len(result), 2)
+        self.assertEqual(mocked_reduce.call_count, 2)
+        collectives.configure("legacy")
+
     def test_invalid_communication_mode_raises(self):
         from minisgl.config import ServerArgs
 

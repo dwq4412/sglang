@@ -158,6 +158,7 @@ def summarize(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "collective_mode": row.get("collective_mode"),
                 "sampling_mode": row.get("sampling_mode"),
                 "tp_size": row.get("tp_size"),
+                "tp_ar_chunk_bytes": row.get("tp_ar_chunk_bytes", 0),
                 "latency_median_ms": row.get("latency_median_ms"),
                 "latency_p90_ms": row.get("latency_p90_ms"),
                 "kernel_median_ms": row.get("kernel_median_ms"),

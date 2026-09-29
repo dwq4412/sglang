@@ -36,6 +36,7 @@ class TestNotebookExperiments(unittest.TestCase):
                     "collective_mode": "legacy",
                     "sampling_mode": "distributed",
                     "tp_size": 2,
+                    "tp_ar_chunk_bytes": 1024,
                     "latency_median_ms": 10,
                     "collective_stats": {
                         "all_gather": {"calls": 4, "bytes": 128},
@@ -49,6 +50,7 @@ class TestNotebookExperiments(unittest.TestCase):
         self.assertEqual(rows[0]["all_gather_bytes"], 128)
         self.assertEqual(rows[0]["all_reduce_calls"], 8)
         self.assertEqual(rows[0]["broadcast_calls"], 2)
+        self.assertEqual(rows[0]["tp_ar_chunk_bytes"], 1024)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ Uses torch.distributed as the backend for collective operations
 __all__ = [
     "all_gather",
     "all_reduce",
+    "all_reduce_chunks",
     "all_reduce_chunked",
     "broadcast",
     "barrier",
@@ -28,9 +29,12 @@ _stats: dict[str, dict[str, float]] = {}
 _gather_buffer: tuple[tuple, torch.Tensor] | None = None
 _gather_workspaces: dict[tuple, torch.Tensor] = {}
 _ar_chunk_bytes = 0
+_MAX_GATHER_WORKSPACES = 8
 
 
-def configure(mode: str = "legacy", stats: bool = False, ar_chunk_bytes: int = 0) -> None:
+def configure(
+    mode: str = "legacy", stats: bool = False, ar_chunk_bytes: int = 0
+) -> None:
     """Select the collective implementation for the current process."""
     global _mode, _stats_enabled, _gather_buffer, _gather_workspaces, _ar_chunk_bytes
     if mode not in ("legacy", "tensor", "buffered", "adaptive"):
@@ -100,9 +104,7 @@ def all_reduce_chunked(tensor: torch.Tensor, group=None) -> torch.Tensor:
     for chunk in flat.tensor_split(chunks):
         try:
             works.append(
-                dist.all_reduce(
-                    chunk, op=dist.ReduceOp.SUM, group=group, async_op=True
-                )
+                dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
             )
         except (TypeError, RuntimeError):
             for work in works:
@@ -124,6 +126,47 @@ def all_reduce_chunked(tensor: torch.Tensor, group=None) -> torch.Tensor:
     return tensor
 
 
+def all_reduce_chunks(chunks: list[torch.Tensor], group=None) -> list[torch.Tensor]:
+    """Asynchronously reduce precomputed output chunks when supported.
+
+    The caller owns the GEMM scheduling; this helper only decides whether the
+    async collective path is safe and waits for every outstanding operation.
+    """
+    if not chunks:
+        return chunks
+    if not is_distributed() or _mode != "adaptive" or _ar_chunk_bytes <= 0:
+        return [all_reduce(chunk, group=group) for chunk in chunks]
+    try:
+        backend = dist.get_backend(group if group is not None else get_tp_group())
+    except (AttributeError, RuntimeError):
+        backend = "unknown"
+    if backend != "nccl" or len(chunks) <= 1:
+        return [all_reduce(chunk, group=group) for chunk in chunks]
+    group = group if group is not None else get_tp_group()
+    works = []
+    originals = [chunk.clone() for chunk in chunks]
+    start = time.perf_counter() if _stats_enabled else 0
+    try:
+        for chunk in chunks:
+            works.append(
+                dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=group, async_op=True)
+            )
+        for work in works:
+            work.wait()
+    except (AttributeError, RuntimeError, TypeError):
+        # A backend may expose async_op but not implement it for this tensor.
+        for work in works:
+            if hasattr(work, "wait"):
+                work.wait()
+        return [all_reduce(original, group=group) for original in originals]
+    _record(
+        "all_reduce",
+        sum(chunk.numel() * chunk.element_size() for chunk in chunks),
+        time.perf_counter() - start if start else 0,
+    )
+    return chunks
+
+
 def all_gather(tensor: torch.Tensor, dim: int = -1, group=None) -> torch.Tensor:
     """All-gather across TP ranks along given dimension."""
     if not is_distributed():
@@ -131,10 +174,14 @@ def all_gather(tensor: torch.Tensor, dim: int = -1, group=None) -> torch.Tensor:
     if not isinstance(tensor, torch.Tensor):
         raise TypeError("all_gather expects a torch.Tensor")
     if tensor.dim() == 0 or tensor.numel() == 0:
-        raise ValueError("all_gather expects a non-empty tensor with at least one dimension")
+        raise ValueError(
+            "all_gather expects a non-empty tensor with at least one dimension"
+        )
     dim = dim if dim >= 0 else tensor.dim() + dim
     if not 0 <= dim < tensor.dim():
-        raise ValueError(f"Invalid gather dimension {dim} for shape {tuple(tensor.shape)}")
+        raise ValueError(
+            f"Invalid gather dimension {dim} for shape {tuple(tensor.shape)}"
+        )
     tp_size = get_tp_size()
     start = time.perf_counter() if _stats_enabled else 0
     if _mode == "legacy":
@@ -149,7 +196,11 @@ def all_gather(tensor: torch.Tensor, dim: int = -1, group=None) -> torch.Tensor:
         local = tensor.movedim(dim, 0).contiguous()
         key = (tuple(local.shape), local.dtype, local.device, tp_size)
         global _gather_buffer
-        if _mode == "buffered" and _gather_buffer is not None and _gather_buffer[0] == key:
+        if (
+            _mode == "buffered"
+            and _gather_buffer is not None
+            and _gather_buffer[0] == key
+        ):
             output = _gather_buffer[1]
         elif _mode == "adaptive" and key in _gather_workspaces:
             output = _gather_workspaces[key]
@@ -162,6 +213,8 @@ def all_gather(tensor: torch.Tensor, dim: int = -1, group=None) -> torch.Tensor:
             if _mode == "buffered":
                 _gather_buffer = (key, output)
             elif _mode == "adaptive":
+                if len(_gather_workspaces) >= _MAX_GATHER_WORKSPACES:
+                    del _gather_workspaces[next(iter(_gather_workspaces))]
                 _gather_workspaces[key] = output
         dist.all_gather_into_tensor(
             output,

@@ -174,9 +174,7 @@ class Engine:
                 "Pass a directory containing config.json."
             )
         if not p.is_dir():
-            raise NotADirectoryError(
-                f"Model path is not a directory: {model_path!r}."
-            )
+            raise NotADirectoryError(f"Model path is not a directory: {model_path!r}.")
         if not (p / "config.json").is_file():
             raise FileNotFoundError(
                 f"Model path has no config.json: {model_path!r}. "
@@ -218,9 +216,7 @@ class Engine:
         logits_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Single forward entry (alias to ModelRunner, kept for GraphRunner)."""
-        return self.runner._run_model(
-            input_ids, positions, attn_meta, logits_indices
-        )
+        return self.runner._run_model(input_ids, positions, attn_meta, logits_indices)
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Run a model forward pass on a scheduler batch (via ModelRunner)."""
@@ -237,8 +233,11 @@ class Engine:
             return False
         if self.server_args.tp_sampling_mode == "adaptive":
             return all(
-                req.sampling_params.temperature <= 0.0
-                and req.sampling_params.top_p >= 1.0
+                req.sampling_params.top_p >= 1.0
+                and (
+                    req.sampling_params.temperature <= 0.0
+                    or req.sampling_params.top_k > 0
+                )
                 for req in batch.reqs
             )
         return all(
@@ -248,8 +247,7 @@ class Engine:
             # nucleus implementation exists.
             req.sampling_params.top_p >= 1.0
             and (
-                req.sampling_params.temperature <= 0.0
-                or req.sampling_params.top_k > 0
+                req.sampling_params.temperature <= 0.0 or req.sampling_params.top_k > 0
             )
             for req in batch.reqs
         )
@@ -285,17 +283,36 @@ class Engine:
         # scheduler mutates request/KV state.
         distributed = self._can_distribute_sampling(batch)
         if distributed:
-            if self.server_args.tp_sampling_mode == "adaptive":
+            if self.server_args.tp_sampling_mode == "adaptive" and all(
+                param.temperature <= 0.0 for param in params
+            ):
                 tokens = self._sample_adaptive_greedy(logits)
-            elif self.server_args.tp_sampling_mode == "distributed_packed":
+            elif self.server_args.tp_sampling_mode in (
+                "distributed_packed",
+                "adaptive",
+            ):
                 tokens = self._sample_distributed_packed(logits, params)
             else:
                 tokens = self._sample_distributed(logits, params)
         else:
-            tokens = self.sampler.sample_batch(logits, params) if get_tp_rank() == 0 else None
-        token_tensor = torch.empty(len(batch.reqs), dtype=torch.long, device=self.device)
+            tokens = (
+                self.sampler.sample_batch(logits, params)
+                if get_tp_rank() == 0
+                else None
+            )
+        if (
+            distributed
+            and self.server_args.tp_sampling_mode == "adaptive"
+            and all(param.temperature <= 0.0 for param in params)
+        ):
+            return tokens
+        token_tensor = torch.empty(
+            len(batch.reqs), dtype=torch.long, device=self.device
+        )
         if tokens is not None:
-            token_tensor.copy_(torch.tensor(tokens, dtype=torch.long, device=self.device))
+            token_tensor.copy_(
+                torch.tensor(tokens, dtype=torch.long, device=self.device)
+            )
         from minisgl.engine.collectives import broadcast
 
         broadcast(token_tensor, src=0)
@@ -309,12 +326,14 @@ class Engine:
         global_values = all_reduce(local_values.clone(), op="max")
         vocab_per_rank = self.model_args.vocab_size // self.tp_size
         global_ids = local_ids + get_tp_rank() * vocab_per_rank
-        invalid = torch.full_like(global_ids, self.model_args.vocab_size)
+        invalid = torch.full_like(global_ids, torch.iinfo(torch.int64).max)
         global_ids = torch.where(local_values == global_values, global_ids, invalid)
         global_ids = all_reduce(global_ids, op="min")
-        return global_ids.tolist() if get_tp_rank() == 0 else None
+        return global_ids.tolist()
 
-    def _sample_distributed(self, logits: torch.Tensor, params: list) -> list[int] | None:
+    def _sample_distributed(
+        self, logits: torch.Tensor, params: list
+    ) -> list[int] | None:
         """Sample from globally bounded candidates without full-vocab gather."""
         from minisgl.engine.collectives import all_gather
 
@@ -343,9 +362,7 @@ class Engine:
         )
 
     @staticmethod
-    def _greedy_candidate_ids(
-        values: torch.Tensor, indices: torch.Tensor
-    ) -> list[int]:
+    def _greedy_candidate_ids(values: torch.Tensor, indices: torch.Tensor) -> list[int]:
         """Select greedy IDs with the same tie break as full-vocab argmax.
 
         Candidate tensors are ordered by TP rank, while ``Tensor.argmax`` on
@@ -356,9 +373,7 @@ class Engine:
         order = indices.argsort(dim=-1, stable=True)
         sorted_values = values.gather(1, order)
         sorted_indices = indices.gather(1, order)
-        selected = sorted_indices.gather(
-            1, sorted_values.argmax(dim=-1, keepdim=True)
-        )
+        selected = sorted_indices.gather(1, sorted_values.argmax(dim=-1, keepdim=True))
         return selected.squeeze(1).tolist()
 
     @staticmethod
@@ -450,7 +465,9 @@ class Engine:
         if self.model_args.vocab_size > torch.iinfo(torch.int32).max:
             raise ValueError("Packed sampling requires a vocabulary <= int32 max")
         indices = indices.to(torch.int32)
-        packet, value_bytes, index_bytes = self._pack_sampling_candidates(values, indices)
+        packet, value_bytes, index_bytes = self._pack_sampling_candidates(
+            values, indices
+        )
         # Gather rows rather than the byte dimension. This makes the rank
         # boundary explicit and avoids relying on the collective backend's
         # handling of a byte packet whose second dimension is later split into
