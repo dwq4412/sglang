@@ -53,7 +53,11 @@ class Engine:
         self._maybe_init_distributed(model_args)
         from minisgl.engine.collectives import configure
 
-        configure(server_args.tp_collective_mode, server_args.collective_stats)
+        configure(
+            server_args.tp_collective_mode,
+            server_args.collective_stats,
+            server_args.tp_ar_chunk_bytes,
+        )
         # Distributed initialization selects the local CUDA/NPU device. Do not
         # cache a device before that point: spawned workers would otherwise all
         # construct their model on device 0.
@@ -228,10 +232,25 @@ class Engine:
         if self.tp_size <= 1 or self.server_args.tp_sampling_mode not in (
             "distributed",
             "distributed_packed",
+            "adaptive",
         ):
             return False
+        if self.server_args.tp_sampling_mode == "adaptive":
+            return all(
+                req.sampling_params.temperature <= 0.0
+                and req.sampling_params.top_p >= 1.0
+                for req in batch.reqs
+            )
         return all(
-            req.sampling_params.temperature <= 0.0 or req.sampling_params.top_k > 0
+            # Bounded local candidates are sufficient for greedy/top-k, but
+            # top-p needs the complete vocabulary to compute global cumulative
+            # probabilities. Keep it on the full-logits path until a global
+            # nucleus implementation exists.
+            req.sampling_params.top_p >= 1.0
+            and (
+                req.sampling_params.temperature <= 0.0
+                or req.sampling_params.top_k > 0
+            )
             for req in batch.reqs
         )
 
@@ -266,7 +285,9 @@ class Engine:
         # scheduler mutates request/KV state.
         distributed = self._can_distribute_sampling(batch)
         if distributed:
-            if self.server_args.tp_sampling_mode == "distributed_packed":
+            if self.server_args.tp_sampling_mode == "adaptive":
+                tokens = self._sample_adaptive_greedy(logits)
+            elif self.server_args.tp_sampling_mode == "distributed_packed":
                 tokens = self._sample_distributed_packed(logits, params)
             else:
                 tokens = self._sample_distributed(logits, params)
@@ -280,6 +301,19 @@ class Engine:
         broadcast(token_tensor, src=0)
         return token_tensor.tolist()
 
+    def _sample_adaptive_greedy(self, logits: torch.Tensor) -> list[int] | None:
+        """Find global greedy IDs using two tiny reductions instead of gathers."""
+        from minisgl.engine.collectives import all_reduce
+
+        local_values, local_ids = logits.max(dim=-1)
+        global_values = all_reduce(local_values.clone(), op="max")
+        vocab_per_rank = self.model_args.vocab_size // self.tp_size
+        global_ids = local_ids + get_tp_rank() * vocab_per_rank
+        invalid = torch.full_like(global_ids, self.model_args.vocab_size)
+        global_ids = torch.where(local_values == global_values, global_ids, invalid)
+        global_ids = all_reduce(global_ids, op="min")
+        return global_ids.tolist() if get_tp_rank() == 0 else None
+
     def _sample_distributed(self, logits: torch.Tensor, params: list) -> list[int] | None:
         """Sample from globally bounded candidates without full-vocab gather."""
         from minisgl.engine.collectives import all_gather
@@ -288,6 +322,9 @@ class Engine:
         max_k = max((max(1, p.top_k) if p.temperature > 0 else 1) for p in params)
         max_k = min(max_k, logits.shape[-1])
         values, indices = logits.topk(max_k, dim=-1)
+        values, indices = self._stabilize_greedy_candidates(
+            logits, values, indices, params
+        )
         indices = indices + get_tp_rank() * vocab_per_rank
 
         # Candidate rows are gathered along the last dimension, so the result
@@ -296,12 +333,59 @@ class Engine:
         indices = all_gather(indices, dim=-1)
         if get_tp_rank() != 0:
             return None
+        if all(p.temperature <= 0.0 for p in params):
+            return self._greedy_candidate_ids(values, indices)
         sampled = self.sampler.sample_batch(values, params)
         return (
             indices.gather(1, torch.tensor(sampled, device=self.device).view(-1, 1))
             .squeeze(1)
             .tolist()
         )
+
+    @staticmethod
+    def _greedy_candidate_ids(
+        values: torch.Tensor, indices: torch.Tensor
+    ) -> list[int]:
+        """Select greedy IDs with the same tie break as full-vocab argmax.
+
+        Candidate tensors are ordered by TP rank, while ``Tensor.argmax`` on
+        gathered full logits breaks equal values by the lowest vocabulary ID.
+        Sorting by ID before argmax preserves that behavior for both regular
+        and byte-packed candidate exchange.
+        """
+        order = indices.argsort(dim=-1, stable=True)
+        sorted_values = values.gather(1, order)
+        sorted_indices = indices.gather(1, order)
+        selected = sorted_indices.gather(
+            1, sorted_values.argmax(dim=-1, keepdim=True)
+        )
+        return selected.squeeze(1).tolist()
+
+    @staticmethod
+    def _stabilize_greedy_candidates(
+        logits: torch.Tensor,
+        values: torch.Tensor,
+        indices: torch.Tensor,
+        params: list,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Ensure each greedy row contains its stable local argmax.
+
+        ``topk`` is not required to resolve equal values by the lowest index.
+        That matters even when ``k == 1``: full-vocabulary ``argmax`` keeps the
+        first maximum, while local ``topk`` may discard it before TP gathering.
+        Put the stable local argmax in the first candidate for greedy rows.
+        """
+        greedy_rows = [p.temperature <= 0.0 for p in params]
+        if not any(greedy_rows):
+            return values, indices
+        row_mask = torch.tensor(greedy_rows, dtype=torch.bool, device=logits.device)
+        local_indices = logits.argmax(dim=-1)
+        row_indices = torch.arange(logits.shape[0], device=logits.device)
+        values = values.clone()
+        indices = indices.clone()
+        values[row_mask, 0] = logits[row_indices[row_mask], local_indices[row_mask]]
+        indices[row_mask, 0] = local_indices[row_mask]
+        return values, indices
 
     @staticmethod
     def _pack_sampling_candidates(
@@ -330,8 +414,18 @@ class Engine:
         values = []
         indices = []
         for chunk in chunks:
-            values.append(chunk[..., :value_bytes].contiguous().view(value_dtype).view(-1, k))
-            indices.append(chunk[..., value_bytes:].contiguous().view(index_dtype).view(-1, k))
+            # Copy the byte ranges before changing dtype. The index range can
+            # start at an unaligned offset when value_bytes is not a multiple
+            # of index_dtype.itemsize (for example FP16 with k=1 followed by
+            # int64 indices).
+            # Flatten before copying so the new byte storage starts at offset
+            # zero. ``contiguous()`` alone preserves the slice's storage offset
+            # (for example 2 bytes for FP16 values), which is still invalid
+            # when the byte tensor is reinterpreted as int64.
+            value_bytes_view = chunk[..., :value_bytes].reshape(-1).clone()
+            index_bytes_view = chunk[..., value_bytes:].reshape(-1).clone()
+            values.append(value_bytes_view.view(value_dtype).view(-1, k))
+            indices.append(index_bytes_view.view(index_dtype).view(-1, k))
         return torch.cat(values, dim=-1), torch.cat(indices, dim=-1)
 
     def _sample_distributed_packed(
@@ -344,9 +438,31 @@ class Engine:
         max_k = max((max(1, p.top_k) if p.temperature > 0 else 1) for p in params)
         max_k = min(max_k, logits.shape[-1])
         values, indices = logits.topk(max_k, dim=-1)
+        values, indices = self._stabilize_greedy_candidates(
+            logits, values, indices, params
+        )
         indices = indices + get_tp_rank() * vocab_per_rank
+        # Token IDs are bounded by the model vocabulary and therefore fit in
+        # int32 for supported models.  Keeping the index field narrow is the
+        # actual payload reduction provided by the packed path: FP16 values
+        # plus int32 IDs use 6 bytes per candidate instead of 10 bytes with
+        # the default int64 top-k indices.
+        if self.model_args.vocab_size > torch.iinfo(torch.int32).max:
+            raise ValueError("Packed sampling requires a vocabulary <= int32 max")
+        indices = indices.to(torch.int32)
         packet, value_bytes, index_bytes = self._pack_sampling_candidates(values, indices)
-        packet = all_gather(packet, dim=-1)
+        # Gather rows rather than the byte dimension. This makes the rank
+        # boundary explicit and avoids relying on the collective backend's
+        # handling of a byte packet whose second dimension is later split into
+        # heterogeneous value/index fields.
+        batch_size = packet.shape[0]
+        packet_width = packet.shape[1]
+        packet = all_gather(packet, dim=0)
+        packet = (
+            packet.view(self.tp_size, batch_size, packet_width)
+            .transpose(0, 1)
+            .reshape(batch_size, self.tp_size * packet_width)
+        )
         values, indices = self._unpack_sampling_candidates(
             packet,
             values.dtype,
@@ -357,6 +473,8 @@ class Engine:
         )
         if get_tp_rank() != 0:
             return None
+        if all(p.temperature <= 0.0 for p in params):
+            return self._greedy_candidate_ids(values, indices)
         sampled = self.sampler.sample_batch(values, params)
         return (
             indices.gather(1, torch.tensor(sampled, device=self.device).view(-1, 1))

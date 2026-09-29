@@ -14,7 +14,25 @@ from pathlib import Path
 from typing import Any
 
 
-ROOT = Path(__file__).resolve().parents[1]
+def _find_root() -> Path:
+    """Find the repository root both from a .py file and from Jupyter."""
+    try:
+        start = Path(__file__).resolve().parent
+    except NameError:
+        # ``__file__`` is not defined when this module is pasted into a cell.
+        start = Path.cwd().resolve()
+
+    candidates = [start, *start.parents]
+    for candidate in candidates:
+        if (candidate / "examples" / "benchmark_distributed.py").exists():
+            return candidate
+    raise FileNotFoundError(
+        "Could not locate the mini-sglang repository root. "
+        "Run the notebook from the repository directory."
+    )
+
+
+ROOT = _find_root()
 BENCHMARK = ROOT / "examples" / "benchmark_distributed.py"
 
 
@@ -24,8 +42,10 @@ def run_benchmark(
     tp_size: int = 1,
     collective_mode: str = "legacy",
     sampling_mode: str = "gather",
-    attention_backend: str = "fa",
-    dtype: str = "auto",
+    tp_ar_chunk_bytes: int = 0,
+    attention_backend: str = "pt",
+    dtype: str = "float16",
+    cache_strategy: str = "naive",
     page_size: int = 16,
     batch_size: int = 1,
     input_len: int = 128,
@@ -66,10 +86,14 @@ def run_benchmark(
         dtype,
         "--attention-backend",
         attention_backend,
+        "--cache-strategy",
+        cache_strategy,
         "--tp-collective-mode",
         collective_mode,
         "--tp-sampling-mode",
         sampling_mode,
+        "--tp-ar-chunk-bytes",
+        str(tp_ar_chunk_bytes),
         "--page-size",
         str(page_size),
         "--batch-size",

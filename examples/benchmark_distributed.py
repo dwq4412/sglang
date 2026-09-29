@@ -85,24 +85,41 @@ def _run_case(
     output_len: int,
     warmup: int,
     repeat: int,
+    cache_strategy: str,
 ) -> dict[str, object]:
     input_ids = list(range(1, input_len + 1))
     sampling = SamplingParams(temperature=0.0, max_tokens=output_len)
 
     def run() -> None:
-        scheduler = Scheduler(args, engine)
+        # Each measured run creates a fresh Scheduler while reusing the Engine.
+        # Radix cache pages belong to the Scheduler's tree, so use the immediate
+        # release policy here to prevent completed runs from pinning pages in an
+        # abandoned tree.
+        scheduler = Scheduler(args, engine, cache_strategy=cache_strategy)
         for _ in range(batch_size):
             scheduler.add_request(list(input_ids), sampling)
-        while not scheduler.is_idle():
+        steps = 0
+        max_steps = max(32, output_len * 4)
+        while not scheduler.is_idle() and steps < max_steps:
             for _ in scheduler.step():
                 pass
+            steps += 1
+        if not scheduler.is_idle():
+            raise RuntimeError(
+                f"benchmark request did not become idle after {steps} steps "
+                f"(cache_strategy={cache_strategy})"
+            )
 
-    for _ in range(warmup):
+    for index in range(warmup):
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"warmup {index + 1}/{warmup}", flush=True)
         _measure(run)
     reset_stats()
     wall_times: list[float] = []
     kernel_times: list[float] = []
-    for _ in range(repeat):
+    for index in range(repeat):
+        if int(os.environ.get("RANK", "0")) == 0:
+            print(f"repeat {index + 1}/{repeat}", flush=True)
         wall_ms, kernel_ms = _measure(run)
         wall_times.append(_max_across_ranks(wall_ms))
         kernel_times.append(_max_across_ranks(kernel_ms))
@@ -152,8 +169,23 @@ def main() -> None:
     parser.add_argument("--tp-size", type=int, default=int(os.environ.get("WORLD_SIZE", "1")))
     parser.add_argument("--dtype", choices=["auto", "float16", "bfloat16", "float32"], default="auto")
     parser.add_argument("--attention-backend", choices=["fa", "pt"], default="fa")
-    parser.add_argument("--tp-collective-mode", choices=["legacy", "tensor", "buffered"], default="legacy")
-    parser.add_argument("--tp-sampling-mode", choices=["gather", "distributed", "distributed_packed"], default="gather")
+    parser.add_argument(
+        "--cache-strategy",
+        choices=["naive", "radix"],
+        default="naive",
+        help="KV cache policy for repeated benchmark runs (default: naive)",
+    )
+    parser.add_argument(
+        "--tp-collective-mode",
+        choices=["legacy", "tensor", "buffered", "adaptive"],
+        default="legacy",
+    )
+    parser.add_argument(
+        "--tp-sampling-mode",
+        choices=["gather", "distributed", "distributed_packed", "adaptive"],
+        default="gather",
+    )
+    parser.add_argument("--tp-ar-chunk-bytes", type=int, default=0)
     parser.add_argument("--collective-stats", action="store_true")
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--max-seq-len", type=int, default=2048)
@@ -177,6 +209,7 @@ def main() -> None:
         cuda_graph_bs=0,
         tp_collective_mode=cli.tp_collective_mode,
         tp_sampling_mode=cli.tp_sampling_mode,
+        tp_ar_chunk_bytes=cli.tp_ar_chunk_bytes,
         collective_stats=cli.collective_stats,
     )
     model_args = ModelArgs.from_pretrained(cli.model_path)
@@ -190,6 +223,7 @@ def main() -> None:
             cli.output_len,
             cli.warmup,
             cli.repeat,
+            cli.cache_strategy,
         )
         row.update(
             {
@@ -197,8 +231,10 @@ def main() -> None:
                 "tp_size": cli.tp_size,
                 "dtype": cli.dtype,
                 "attention_backend": cli.attention_backend,
+                "cache_strategy": cli.cache_strategy,
                 "collective_mode": cli.tp_collective_mode,
                 "sampling_mode": cli.tp_sampling_mode,
+                "tp_ar_chunk_bytes": cli.tp_ar_chunk_bytes,
                 "page_size": cli.page_size,
                 "torch_version": torch.__version__,
             }

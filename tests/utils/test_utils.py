@@ -165,6 +165,31 @@ class TestDistributed(unittest.TestCase):
 
         self.assertIs(outputs[0], outputs[1])
 
+    def test_all_gather_adaptive_reuses_each_shape_workspace(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        outputs = []
+
+        def fake_into(output, input_tensor, **kwargs):
+            outputs.append(output)
+            output.copy_(input_tensor.repeat(2, *([1] * (input_tensor.dim() - 1))))
+
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives, "get_tp_size", return_value=2
+        ), mock.patch.object(collectives.dist, "all_gather_into_tensor", side_effect=fake_into):
+            collectives.configure("adaptive")
+            x = torch.arange(4).reshape(2, 2)
+            y = torch.arange(6).reshape(3, 2)
+            collectives.all_gather(x)
+            collectives.all_gather(y)
+            collectives.all_gather(x)
+
+        self.assertIs(outputs[0], outputs[2])
+        self.assertIsNot(outputs[0], outputs[1])
+        collectives.configure("legacy")
+
     def test_invalid_communication_mode_raises(self):
         from minisgl.config import ServerArgs
 
@@ -176,6 +201,10 @@ class TestDistributed(unittest.TestCase):
             ServerArgs(tp_sampling_mode="distributed_packed").tp_sampling_mode,
             "distributed_packed",
         )
+        self.assertEqual(
+            ServerArgs(tp_sampling_mode="adaptive").tp_sampling_mode, "adaptive"
+        )
+        self.assertEqual(ServerArgs(tp_ar_chunk_bytes=-1).tp_ar_chunk_bytes, 0)
 
     def test_packed_sampling_candidates_preserve_values_and_indices(self):
         from minisgl.engine.engine import Engine
@@ -190,6 +219,119 @@ class TestDistributed(unittest.TestCase):
         )
         self.assertTrue(torch.equal(got_values, values))
         self.assertTrue(torch.equal(got_indices, indices))
+
+    def test_packed_sampling_candidates_handle_unaligned_index_offset(self):
+        from minisgl.engine.engine import Engine
+
+        values = torch.tensor([[1.25], [-2.5]], dtype=torch.float16)
+        indices = torch.tensor([[7], [13]], dtype=torch.long)
+        packet, value_bytes, index_bytes = Engine._pack_sampling_candidates(
+            values, indices
+        )
+        got_values, got_indices = Engine._unpack_sampling_candidates(
+            packet, values.dtype, indices.dtype, 1, value_bytes, index_bytes
+        )
+        self.assertTrue(torch.equal(got_values, values))
+        self.assertTrue(torch.equal(got_indices, indices))
+
+    def test_packed_sampling_candidates_can_use_int32_indices(self):
+        from minisgl.engine.engine import Engine
+
+        values = torch.tensor([[1.25, -2.5]], dtype=torch.float16)
+        indices = torch.tensor([[7, 13]], dtype=torch.int32)
+        packet, value_bytes, index_bytes = Engine._pack_sampling_candidates(
+            values, indices
+        )
+        got_values, got_indices = Engine._unpack_sampling_candidates(
+            packet, values.dtype, indices.dtype, 2, value_bytes, index_bytes
+        )
+
+        self.assertEqual(packet.shape[-1], 2 * (2 + 4))
+        self.assertTrue(torch.equal(got_values, values))
+        self.assertTrue(torch.equal(got_indices, indices))
+
+    def test_packed_sampling_candidates_unpack_multiple_rank_packets(self):
+        from minisgl.engine.engine import Engine
+
+        rank0_values = torch.tensor([[5.0]], dtype=torch.float16)
+        rank0_indices = torch.tensor([[58]], dtype=torch.long)
+        rank1_values = torch.tensor([[4.0]], dtype=torch.float16)
+        rank1_indices = torch.tensor([[99]], dtype=torch.long)
+        rank0_packet, value_bytes, index_bytes = Engine._pack_sampling_candidates(
+            rank0_values, rank0_indices
+        )
+        rank1_packet, _, _ = Engine._pack_sampling_candidates(
+            rank1_values, rank1_indices
+        )
+        gathered = torch.cat((rank0_packet, rank1_packet), dim=0)
+        gathered = gathered.view(2, 1, -1).transpose(0, 1).reshape(1, -1)
+        self.assertEqual(gathered.shape, (1, 20))
+        self.assertEqual(gathered.stride(0), 20)
+
+        values, indices = Engine._unpack_sampling_candidates(
+            gathered,
+            rank0_values.dtype,
+            rank0_indices.dtype,
+            1,
+            value_bytes,
+            index_bytes,
+        )
+
+        self.assertTrue(torch.equal(values, torch.tensor([[5.0, 4.0]], dtype=torch.float16)))
+        self.assertTrue(torch.equal(indices, torch.tensor([[58, 99]], dtype=torch.long)))
+
+    def test_distributed_sampling_requires_full_vocab_for_top_p(self):
+        from minisgl.config import SamplingParams
+        from minisgl.engine.engine import Engine
+
+        class Request:
+            def __init__(self, params):
+                self.sampling_params = params
+
+        class Batch:
+            def __init__(self, params):
+                self.reqs = [Request(params)]
+
+        engine = object.__new__(Engine)
+        engine.tp_size = 2
+        engine.server_args = type(
+            "Args",
+            (),
+            {
+                "tp_sampling_mode": "distributed_packed",
+            },
+        )()
+
+        self.assertTrue(
+            engine._can_distribute_sampling(
+                Batch(SamplingParams(temperature=0.0, top_p=1.0))
+            )
+        )
+        self.assertFalse(
+            engine._can_distribute_sampling(
+                Batch(SamplingParams(temperature=0.0, top_p=0.9))
+            )
+        )
+
+    def test_greedy_candidate_ids_break_ties_by_lowest_vocab_id(self):
+        from minisgl.engine.engine import Engine
+
+        values = torch.tensor([[2.0, 5.0, 5.0, 1.0]])
+        indices = torch.tensor([[8, 12, 3, 20]])
+
+        self.assertEqual(Engine._greedy_candidate_ids(values, indices), [3])
+
+    def test_stabilize_greedy_candidates_keeps_local_first_maximum(self):
+        from minisgl.engine.engine import Engine
+
+        logits = torch.tensor([[5.0, 5.0, 2.0], [1.0, 4.0, 4.0]])
+        values, indices = logits.topk(1, dim=-1)
+        values, indices = Engine._stabilize_greedy_candidates(
+            logits, values, indices, [type("Params", (), {"temperature": 0.0})() for _ in range(2)]
+        )
+
+        self.assertTrue(torch.equal(indices.squeeze(-1), torch.tensor([0, 1])))
+        self.assertTrue(torch.equal(values.squeeze(-1), torch.tensor([5.0, 4.0])))
 
 
 # ── Test Weight Loading ──

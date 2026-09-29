@@ -33,6 +33,7 @@ class LLM:
         memory_ratio: float = 0.9,
         tp_collective_mode: str = "legacy",
         tp_sampling_mode: str = "gather",
+        tp_ar_chunk_bytes: int = 0,
         collective_stats: bool = False,
     ) -> None:
         self.model_path = model_path
@@ -47,6 +48,7 @@ class LLM:
             memory_ratio=memory_ratio,
             tp_collective_mode=tp_collective_mode,
             tp_sampling_mode=tp_sampling_mode,
+            tp_ar_chunk_bytes=tp_ar_chunk_bytes,
             collective_stats=collective_stats,
         )
 

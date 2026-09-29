@@ -87,12 +87,17 @@ def parse_args() -> ServerArgs:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
-    parser.add_argument("--tp-collective-mode", choices=["legacy", "tensor", "buffered"], default="legacy")
+    parser.add_argument(
+        "--tp-collective-mode",
+        choices=["legacy", "tensor", "buffered", "adaptive"],
+        default="legacy",
+    )
     parser.add_argument(
         "--tp-sampling-mode",
-        choices=["gather", "distributed", "distributed_packed"],
+        choices=["gather", "distributed", "distributed_packed", "adaptive"],
         default="gather",
     )
+    parser.add_argument("--tp-ar-chunk-bytes", type=int, default=0)
     parser.add_argument("--collective-stats", action="store_true")
     parsed = parser.parse_args()
     if parsed.tp_size < 1 or parsed.tp_size > 8:
@@ -123,6 +128,7 @@ def run_shell(args: ServerArgs) -> None:
         memory_ratio=args.memory_ratio,
         tp_collective_mode=args.tp_collective_mode,
         tp_sampling_mode=args.tp_sampling_mode,
+        tp_ar_chunk_bytes=args.tp_ar_chunk_bytes,
         collective_stats=args.collective_stats,
     )
 

@@ -83,9 +83,9 @@ class RowParallelLinear(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = F.linear(x, self.weight)
         if is_distributed():
-            from minisgl.engine.collectives import all_reduce
+            from minisgl.engine.collectives import all_reduce_chunked
 
-            out = all_reduce(out)
+            out = all_reduce_chunked(out)
         if self.bias is not None:
             out = out + self.bias
         return out

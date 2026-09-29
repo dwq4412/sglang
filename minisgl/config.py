@@ -55,15 +55,28 @@ class ServerArgs:
     log_level: str = "INFO"
     tp_collective_mode: str = "legacy"
     tp_sampling_mode: str = "gather"
+    tp_ar_chunk_bytes: int = 0
     collective_stats: bool = False
 
     def __post_init__(self) -> None:
-        if self.tp_collective_mode not in ("legacy", "tensor", "buffered"):
-            raise ValueError("tp_collective_mode must be legacy, tensor, or buffered")
-        if self.tp_sampling_mode not in ("gather", "distributed", "distributed_packed"):
+        if self.tp_collective_mode not in (
+            "legacy",
+            "tensor",
+            "buffered",
+            "adaptive",
+        ):
             raise ValueError(
-                "tp_sampling_mode must be gather, distributed, or distributed_packed"
+                "tp_collective_mode must be legacy, tensor, buffered, or adaptive"
             )
+        if self.tp_sampling_mode not in (
+            "gather", "distributed", "distributed_packed", "adaptive"
+        ):
+            raise ValueError(
+                "tp_sampling_mode must be gather, distributed, distributed_packed, "
+                "or adaptive"
+            )
+        if self.tp_ar_chunk_bytes < 0:
+            self.tp_ar_chunk_bytes = 0
         if self.cuda_graph_bs is None:
             self.cuda_graph_bs = self.max_running_req
         if self.device != "auto":
