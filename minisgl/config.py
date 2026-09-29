@@ -53,8 +53,17 @@ class ServerArgs:
     trust_remote_code: bool = False
     shell: bool = False
     log_level: str = "INFO"
+    tp_collective_mode: str = "legacy"
+    tp_sampling_mode: str = "gather"
+    collective_stats: bool = False
 
     def __post_init__(self) -> None:
+        if self.tp_collective_mode not in ("legacy", "tensor", "buffered"):
+            raise ValueError("tp_collective_mode must be legacy, tensor, or buffered")
+        if self.tp_sampling_mode not in ("gather", "distributed", "distributed_packed"):
+            raise ValueError(
+                "tp_sampling_mode must be gather, distributed, or distributed_packed"
+            )
         if self.cuda_graph_bs is None:
             self.cuda_graph_bs = self.max_running_req
         if self.device != "auto":

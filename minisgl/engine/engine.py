@@ -51,6 +51,9 @@ class Engine:
         self._device_type = get_device_type()
 
         self._maybe_init_distributed(model_args)
+        from minisgl.engine.collectives import configure
+
+        configure(server_args.tp_collective_mode, server_args.collective_stats)
         # Distributed initialization selects the local CUDA/NPU device. Do not
         # cache a device before that point: spawned workers would otherwise all
         # construct their model on device 0.
@@ -217,7 +220,26 @@ class Engine:
 
     def forward(self, batch: Batch) -> torch.Tensor:
         """Run a model forward pass on a scheduler batch (via ModelRunner)."""
+        self._set_logits_gather(self._can_distribute_sampling(batch))
         return self.runner.forward(batch)
+
+    def _can_distribute_sampling(self, batch: Batch) -> bool:
+        """Return whether this batch can use bounded local-vocab sampling."""
+        if self.tp_size <= 1 or self.server_args.tp_sampling_mode not in (
+            "distributed",
+            "distributed_packed",
+        ):
+            return False
+        return all(
+            req.sampling_params.temperature <= 0.0 or req.sampling_params.top_k > 0
+            for req in batch.reqs
+        )
+
+    def _set_logits_gather(self, distributed: bool) -> None:
+        lm_head = getattr(self.model, "lm_head", None)
+        if lm_head is not None:
+            # The default remains True, preserving the original full-logits path.
+            lm_head.gather_output = not distributed
 
     def sample(self, logits: torch.Tensor, batch: Batch) -> list[int]:
         """Sample next tokens from logits.
@@ -242,7 +264,14 @@ class Engine:
         # Sampling is a control-plane operation. Only rank 0 consumes random
         # state; every rank receives exactly the same token IDs before the
         # scheduler mutates request/KV state.
-        tokens = self.sampler.sample_batch(logits, params) if get_tp_rank() == 0 else None
+        distributed = self._can_distribute_sampling(batch)
+        if distributed:
+            if self.server_args.tp_sampling_mode == "distributed_packed":
+                tokens = self._sample_distributed_packed(logits, params)
+            else:
+                tokens = self._sample_distributed(logits, params)
+        else:
+            tokens = self.sampler.sample_batch(logits, params) if get_tp_rank() == 0 else None
         token_tensor = torch.empty(len(batch.reqs), dtype=torch.long, device=self.device)
         if tokens is not None:
             token_tensor.copy_(torch.tensor(tokens, dtype=torch.long, device=self.device))
@@ -250,3 +279,87 @@ class Engine:
 
         broadcast(token_tensor, src=0)
         return token_tensor.tolist()
+
+    def _sample_distributed(self, logits: torch.Tensor, params: list) -> list[int] | None:
+        """Sample from globally bounded candidates without full-vocab gather."""
+        from minisgl.engine.collectives import all_gather
+
+        vocab_per_rank = self.model_args.vocab_size // self.tp_size
+        max_k = max((max(1, p.top_k) if p.temperature > 0 else 1) for p in params)
+        max_k = min(max_k, logits.shape[-1])
+        values, indices = logits.topk(max_k, dim=-1)
+        indices = indices + get_tp_rank() * vocab_per_rank
+
+        # Candidate rows are gathered along the last dimension, so the result
+        # is [batch, tp_size * k] and can be passed to the existing sampler.
+        values = all_gather(values, dim=-1)
+        indices = all_gather(indices, dim=-1)
+        if get_tp_rank() != 0:
+            return None
+        sampled = self.sampler.sample_batch(values, params)
+        return (
+            indices.gather(1, torch.tensor(sampled, device=self.device).view(-1, 1))
+            .squeeze(1)
+            .tolist()
+        )
+
+    @staticmethod
+    def _pack_sampling_candidates(
+        values: torch.Tensor, indices: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
+        """Pack heterogeneous candidate tensors without changing their bits."""
+        batch = values.shape[0]
+        value_bytes = values.element_size() * values.shape[1]
+        index_bytes = indices.element_size() * indices.shape[1]
+        value_packet = values.contiguous().view(torch.uint8).view(batch, value_bytes)
+        index_packet = indices.contiguous().view(torch.uint8).view(batch, index_bytes)
+        return torch.cat((value_packet, index_packet), dim=-1), value_bytes, index_bytes
+
+    @staticmethod
+    def _unpack_sampling_candidates(
+        packet: torch.Tensor,
+        value_dtype: torch.dtype,
+        index_dtype: torch.dtype,
+        k: int,
+        value_bytes: int,
+        index_bytes: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Restore gathered candidates from a byte packet."""
+        packet_width = value_bytes + index_bytes
+        chunks = packet.split(packet_width, dim=-1)
+        values = []
+        indices = []
+        for chunk in chunks:
+            values.append(chunk[..., :value_bytes].contiguous().view(value_dtype).view(-1, k))
+            indices.append(chunk[..., value_bytes:].contiguous().view(index_dtype).view(-1, k))
+        return torch.cat(values, dim=-1), torch.cat(indices, dim=-1)
+
+    def _sample_distributed_packed(
+        self, logits: torch.Tensor, params: list
+    ) -> list[int] | None:
+        """Sample bounded candidates with one byte-packed all-gather."""
+        from minisgl.engine.collectives import all_gather
+
+        vocab_per_rank = self.model_args.vocab_size // self.tp_size
+        max_k = max((max(1, p.top_k) if p.temperature > 0 else 1) for p in params)
+        max_k = min(max_k, logits.shape[-1])
+        values, indices = logits.topk(max_k, dim=-1)
+        indices = indices + get_tp_rank() * vocab_per_rank
+        packet, value_bytes, index_bytes = self._pack_sampling_candidates(values, indices)
+        packet = all_gather(packet, dim=-1)
+        values, indices = self._unpack_sampling_candidates(
+            packet,
+            values.dtype,
+            indices.dtype,
+            max_k,
+            value_bytes,
+            index_bytes,
+        )
+        if get_tp_rank() != 0:
+            return None
+        sampled = self.sampler.sample_batch(values, params)
+        return (
+            indices.gather(1, torch.tensor(sampled, device=self.device).view(-1, 1))
+            .squeeze(1)
+            .tolist()
+        )

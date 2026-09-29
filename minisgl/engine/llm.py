@@ -31,6 +31,9 @@ class LLM:
         trust_remote_code: bool = False,
         max_seq_len: int = 8192,
         memory_ratio: float = 0.9,
+        tp_collective_mode: str = "legacy",
+        tp_sampling_mode: str = "gather",
+        collective_stats: bool = False,
     ) -> None:
         self.model_path = model_path
 
@@ -42,6 +45,9 @@ class LLM:
             trust_remote_code=trust_remote_code,
             max_seq_len=max_seq_len,
             memory_ratio=memory_ratio,
+            tp_collective_mode=tp_collective_mode,
+            tp_sampling_mode=tp_sampling_mode,
+            collective_stats=collective_stats,
         )
 
         model_args = ModelArgs.from_pretrained(model_path)

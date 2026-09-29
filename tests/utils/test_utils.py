@@ -106,6 +106,91 @@ class TestDistributed(unittest.TestCase):
         with self.assertRaises(ValueError):
             all_reduce(torch.randn(4), op="avg")
 
+    def test_broadcast_records_stats(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        x = torch.arange(4)
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives.dist, "broadcast"
+        ):
+            collectives.configure("legacy", stats=True)
+            collectives.reset_stats()
+            collectives.broadcast(x)
+            stats = collectives.get_stats()
+
+        self.assertEqual(stats["broadcast"]["calls"], 1)
+        self.assertEqual(stats["broadcast"]["bytes"], x.numel() * x.element_size())
+        collectives.configure("legacy")
+
+    def test_all_gather_tensor_mode_preserves_last_dimension(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        x = torch.arange(6).reshape(2, 3)
+
+        def fake_into(output, input_tensor, **kwargs):
+            output[:3].copy_(input_tensor)
+            output[3:].copy_(input_tensor + 10)
+
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives, "get_tp_size", return_value=2
+        ), mock.patch.object(collectives.dist, "all_gather_into_tensor", side_effect=fake_into):
+            collectives.configure("tensor")
+            got = collectives.all_gather(x, dim=-1)
+
+        self.assertEqual(got.tolist(), [[0, 1, 2, 10, 11, 12], [3, 4, 5, 13, 14, 15]])
+
+    def test_all_gather_buffered_reuses_output(self):
+        from unittest import mock
+
+        import minisgl.engine.collectives as collectives
+
+        x = torch.arange(4).reshape(2, 2)
+        outputs = []
+
+        def fake_into(output, input_tensor, **kwargs):
+            outputs.append(output)
+            output[:2].copy_(input_tensor)
+            output[2:].copy_(input_tensor)
+
+        with mock.patch.object(collectives, "is_distributed", return_value=True), mock.patch.object(
+            collectives, "get_tp_size", return_value=2
+        ), mock.patch.object(collectives.dist, "all_gather_into_tensor", side_effect=fake_into):
+            collectives.configure("buffered")
+            collectives.all_gather(x)
+            collectives.all_gather(x)
+
+        self.assertIs(outputs[0], outputs[1])
+
+    def test_invalid_communication_mode_raises(self):
+        from minisgl.config import ServerArgs
+
+        with self.assertRaises(ValueError):
+            ServerArgs(tp_collective_mode="invalid")
+        with self.assertRaises(ValueError):
+            ServerArgs(tp_sampling_mode="invalid")
+        self.assertEqual(
+            ServerArgs(tp_sampling_mode="distributed_packed").tp_sampling_mode,
+            "distributed_packed",
+        )
+
+    def test_packed_sampling_candidates_preserve_values_and_indices(self):
+        from minisgl.engine.engine import Engine
+
+        values = torch.tensor([[1.25, -2.5], [3.0, 4.5]], dtype=torch.float32)
+        indices = torch.tensor([[7, 9], [11, 13]], dtype=torch.long)
+        packet, value_bytes, index_bytes = Engine._pack_sampling_candidates(
+            values, indices
+        )
+        got_values, got_indices = Engine._unpack_sampling_candidates(
+            packet, values.dtype, indices.dtype, 2, value_bytes, index_bytes
+        )
+        self.assertTrue(torch.equal(got_values, values))
+        self.assertTrue(torch.equal(got_indices, indices))
+
 
 # ── Test Weight Loading ──
 

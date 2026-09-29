@@ -87,6 +87,13 @@ def parse_args() -> ServerArgs:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
     )
+    parser.add_argument("--tp-collective-mode", choices=["legacy", "tensor", "buffered"], default="legacy")
+    parser.add_argument(
+        "--tp-sampling-mode",
+        choices=["gather", "distributed", "distributed_packed"],
+        default="gather",
+    )
+    parser.add_argument("--collective-stats", action="store_true")
     parsed = parser.parse_args()
     if parsed.tp_size < 1 or parsed.tp_size > 8:
         parser.error("tp_size must be between 1 and 8")
@@ -114,6 +121,9 @@ def run_shell(args: ServerArgs) -> None:
         trust_remote_code=args.trust_remote_code,
         max_seq_len=args.max_seq_len,
         memory_ratio=args.memory_ratio,
+        tp_collective_mode=args.tp_collective_mode,
+        tp_sampling_mode=args.tp_sampling_mode,
+        collective_stats=args.collective_stats,
     )
 
     print("\nMini-SGLang Interactive Shell")
