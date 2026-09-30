@@ -26,6 +26,15 @@ def parse_args() -> ServerArgs:
     parser.add_argument("--host", type=str, default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
+        "--disaggregation-transfer-backend",
+        choices=["none", "shm", "shm_pinned"],
+        default="none",
+    )
+    parser.add_argument("--pd-devices", type=int, nargs=2, default=(0, 1))
+    parser.add_argument("--disaggregation-shm-slot-count", type=int, default=2)
+    parser.add_argument("--disaggregation-shm-chunk-tokens", type=int, default=512)
+    parser.add_argument("--pd-timeout", type=float, default=600.0)
+    parser.add_argument(
         "--tp-size",
         type=int,
         default=1,
@@ -130,6 +139,11 @@ def run_shell(args: ServerArgs) -> None:
         tp_sampling_mode=args.tp_sampling_mode,
         tp_ar_chunk_bytes=args.tp_ar_chunk_bytes,
         collective_stats=args.collective_stats,
+        disaggregation_transfer_backend=args.disaggregation_transfer_backend,
+        pd_devices=tuple(args.pd_devices),
+        disaggregation_shm_slot_count=args.disaggregation_shm_slot_count,
+        disaggregation_shm_chunk_tokens=args.disaggregation_shm_chunk_tokens,
+        pd_timeout=args.pd_timeout,
     )
 
     print("\nMini-SGLang Interactive Shell")

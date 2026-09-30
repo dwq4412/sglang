@@ -236,6 +236,11 @@ class DistributedSchedulerProxy:
 
 def create_scheduler_runtime(args: ServerArgs, model_args: ModelArgs):
     """Return the existing local runtime or an automatic TP proxy."""
+    if args.disaggregation_transfer_backend != "none":
+        from minisgl.disaggregation.runtime import PDSchedulerProxy
+
+        proxy = PDSchedulerProxy(args, model_args)
+        return proxy, proxy
     if args.tp_size == 1:
         from minisgl.engine.engine import Engine
         from minisgl.scheduler.scheduler import Scheduler

@@ -35,6 +35,11 @@ class LLM:
         tp_sampling_mode: str = "gather",
         tp_ar_chunk_bytes: int = 0,
         collective_stats: bool = False,
+        disaggregation_transfer_backend: str = "none",
+        pd_devices: tuple[int, int] = (0, 1),
+        disaggregation_shm_slot_count: int = 2,
+        disaggregation_shm_chunk_tokens: int = 512,
+        pd_timeout: float = 600.0,
     ) -> None:
         self.model_path = model_path
 
@@ -50,6 +55,11 @@ class LLM:
             tp_sampling_mode=tp_sampling_mode,
             tp_ar_chunk_bytes=tp_ar_chunk_bytes,
             collective_stats=collective_stats,
+            disaggregation_transfer_backend=disaggregation_transfer_backend,
+            pd_devices=pd_devices,
+            disaggregation_shm_slot_count=disaggregation_shm_slot_count,
+            disaggregation_shm_chunk_tokens=disaggregation_shm_chunk_tokens,
+            pd_timeout=pd_timeout,
         )
 
         model_args = ModelArgs.from_pretrained(model_path)

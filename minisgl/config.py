@@ -58,6 +58,12 @@ class ServerArgs:
     tp_ar_chunk_bytes: int = 0
     collective_stats: bool = False
 
+    disaggregation_transfer_backend: str = "none"
+    pd_devices: tuple[int, int] = (0, 1)
+    disaggregation_shm_slot_count: int = 2
+    disaggregation_shm_chunk_tokens: int = 512
+    pd_timeout: float = 600.0
+
     def __post_init__(self) -> None:
         if self.tp_collective_mode not in (
             "legacy",
@@ -77,6 +83,30 @@ class ServerArgs:
             )
         if self.tp_ar_chunk_bytes < 0:
             self.tp_ar_chunk_bytes = 0
+        if self.disaggregation_transfer_backend not in ("none", "shm", "shm_pinned"):
+            raise ValueError("Unknown disaggregation transfer backend")
+        if self.disaggregation_transfer_backend != "none":
+            if self.tp_size != 1 or self.device not in ("auto", "cuda", "cpu"):
+                raise ValueError(
+                    "PD requires tp_size=1 and CUDA (or CPU for shm tests)"
+                )
+            if (
+                len(self.pd_devices) != 2
+                or len(set(self.pd_devices)) != 2
+                or min(self.pd_devices) < 0
+            ):
+                raise ValueError("PD requires two distinct nonnegative GPU indices")
+            if (
+                min(
+                    self.disaggregation_shm_slot_count,
+                    self.disaggregation_shm_chunk_tokens,
+                    self.pd_timeout,
+                )
+                <= 0
+            ):
+                raise ValueError(
+                    "PD slot count, chunk tokens and timeout must be positive"
+                )
         if self.cuda_graph_bs is None:
             self.cuda_graph_bs = self.max_running_req
         if self.device != "auto":

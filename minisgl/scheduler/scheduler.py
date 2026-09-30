@@ -202,6 +202,35 @@ class Scheduler:
         self.prefill_manager.add_request(req)
         return uid
 
+    def add_transferred_request(
+        self,
+        input_ids: list[int],
+        sampling_params: SamplingParams,
+        uid: int,
+        page_ids: list[int],
+    ) -> None:
+        """Register a request whose prompt KV was already copied into ``page_ids``."""
+        from minisgl.engine.kvcache.pool import BaseCacheHandle
+
+        req = Req(
+            input_ids=list(input_ids),
+            uid=uid,
+            sampling_params=sampling_params,
+            cache_handle=BaseCacheHandle(page_ids=list(page_ids)),
+            status=SequenceStatus.RUNNING,
+        )
+        with self.prefill_manager._lock:
+            self.prefill_manager.running.append(req)
+
+    def release_request(self, uid: int) -> bool:
+        """Release a source-side request after its KV has been transferred."""
+        with self.prefill_manager._lock:
+            for req in list(self.prefill_manager.running):
+                if req.uid == uid:
+                    self.prefill_manager._remove_finished_nolock(req)
+                    return True
+        return False
+
     def _abort_result(self, uid: int) -> OutputToken:
         """Result for a request aborted before it ever ran.
 
@@ -322,7 +351,7 @@ class Scheduler:
                 )
             )
 
-    def step(self) -> list[OutputToken]:
+    def step(self, *, prefill_only: bool = False) -> list[OutputToken]:
         """Run one scheduler iteration: prefill new requests, then decode running ones.
 
         Returns a list of OutputToken, one per produced token. finish_reason is
@@ -344,9 +373,7 @@ class Scheduler:
 
         prefill_batch = self.prefill_manager.schedule_prefill()
         if prefill_batch is not None:
-            self._run_phase(
-                prefill_batch, results, finished_reqs, rollback_reqs
-            )
+            self._run_phase(prefill_batch, results, finished_reqs, rollback_reqs)
 
         # Requests aborted during scheduling never ran; report them as finished
         # so callers waiting on them stop waiting. `aborted` is mutated under
@@ -362,13 +389,13 @@ class Scheduler:
         # under that same lock, so this guard prevents iterating a list that a
         # concurrent abort is mutating.
         with self.prefill_manager._lock:
-            running = [req for req in self.prefill_manager.running if not req.is_finished]
-        if running:
+            running = [
+                req for req in self.prefill_manager.running if not req.is_finished
+            ]
+        if running and not prefill_only:
             decode_batch = self.decode_manager.schedule_decode(running)
             if decode_batch is not None:
-                self._run_phase(
-                    decode_batch, results, finished_reqs, rollback_reqs
-                )
+                self._run_phase(decode_batch, results, finished_reqs, rollback_reqs)
 
         if finished_reqs:
             self.prefill_manager.remove_finished_batch(finished_reqs)
