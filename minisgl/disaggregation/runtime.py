@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
 import multiprocessing as mp
-import os
 import queue
 import time
 from dataclasses import dataclass
@@ -23,11 +23,31 @@ class _Command:
     payload: tuple[Any, ...] = ()
 
 
+def _tensor_bytes(tensor: torch.Tensor) -> bytes:
+    """Serialize tensor storage without requiring NumPy to support its dtype."""
+    contiguous = tensor.detach().contiguous()
+    return contiguous.view(torch.uint8).numpy().tobytes()
+
+
 def _worker(role, args, model_args, commands, results, errors, ring_name, ring_size):
     engine = ring = None
     pending = {}
     try:
-        os.environ["CUDA_VISIBLE_DEVICES"] = str(args.pd_devices[role == "decode"])
+        device_index = args.pd_devices[role == "decode"]
+        if torch.cuda.is_available():
+            # Each PD worker sees the original physical device namespace. Do
+            # not change CUDA_VISIBLE_DEVICES here: by the time a spawned
+            # worker imports this module, CUDA may already have been queried.
+            # Explicitly selecting the physical device is unambiguous and
+            # prevents both workers from defaulting to device 0.
+            torch.cuda.set_device(device_index)
+            # logger.info(
+            #     "PD worker role=%s pid=%d using cuda:%d (current=%d)",
+            #     role,
+            #     os.getpid(),
+            #     device_index,
+            #     torch.cuda.current_device(),
+            # )
         from minisgl.engine.engine import Engine
         from minisgl.scheduler.scheduler import Scheduler
 
@@ -40,10 +60,14 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
         )
         engine = Engine(worker_args, model_args, tp_rank=0)
         scheduler = Scheduler(worker_args, engine, cache_strategy="naive")
-        ring = ShmRing(ring_size, args.disaggregation_shm_slot_count, ring_name, False)
+        if args.disaggregation_transfer_backend != "queue":
+            ring = ShmRing(
+                ring_size, args.disaggregation_shm_slot_count, ring_name, False
+            )
         if args.disaggregation_transfer_backend == "shm_pinned":
             ring.register_cuda()
         results.put((role, "READY"))
+        # logger.info("PD worker role=%s READY", role)
         while True:
             cmd = commands.get()
             if cmd.name == "ADD":
@@ -52,13 +76,18 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
             elif cmd.name == "ABORT":
                 scheduler.abort_request(cmd.payload[0])
             elif cmd.name == "TRANSFER":
-                ids, sampling, uid, slot, length, meta_bytes, offset, total_pages = (
+                ids, sampling, uid, payload, meta_bytes, offset, total_pages = (
                     cmd.payload
                 )
                 meta = TransferMeta.unpack(meta_bytes)
                 dtype = getattr(torch, meta.dtype.removeprefix("torch."))
+                if args.disaggregation_transfer_backend == "queue":
+                    raw = payload
+                else:
+                    slot, length = payload
+                    raw = ring.get(slot, length)
                 source = torch.frombuffer(
-                    bytearray(ring.get(slot, length)), dtype=dtype
+                    bytearray(raw), dtype=dtype
                 ).reshape(meta.shape)
                 handle = pending.get(uid)
                 if handle is None:
@@ -74,14 +103,25 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                     )
                     del pending[uid]
                 results.put((role, "TRANSFERRED", uid))
+                # logger.info(
+                #     "PD worker role=%s transferred uid=%s pages=%d/%d",
+                #     role,
+                #     uid,
+                #     offset,
+                #     len(pages),
+                # )
             elif cmd.name == "STEP":
+                # logger.info("PD worker role=%s starting STEP", role)
                 outputs = scheduler.step(prefill_only=role == "prefill")
                 transfers = []
                 if role == "prefill":
-                    for uid in {out.uid for out in outputs if not out.finished}:
-                        req = next(
-                            r for r in scheduler.prefill_manager.running if r.uid == uid
-                        )
+                    # Prefill produces the first output token. That token may
+                    # also finish the request (max_tokens=1 or EOS), so using
+                    # ``not out.finished`` to find transfer candidates loses
+                    # the KV cache for exactly those valid requests. Requests
+                    # that still need decode are the ones left in running.
+                    for req in list(scheduler.prefill_manager.running):
+                        uid = req.uid
                         pages = list(req.cache_handle.page_ids)
                         per_chunk = max(
                             1, args.disaggregation_shm_chunk_tokens // args.page_size
@@ -96,7 +136,11 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                             ].detach()
                             if tensor.device.type != "cpu":
                                 tensor = tensor.to("cpu")
-                            raw = tensor.contiguous().numpy().tobytes()
+                            # NumPy does not support a BF16 view in some
+                            # PyTorch/NumPy combinations. Serialize the
+                            # tensor as raw bytes instead; the metadata keeps
+                            # the original dtype for the decode worker.
+                            raw = _tensor_bytes(tensor)
                             meta = TransferMeta(
                                 TransferKey("session", uid),
                                 tuple(tensor.shape),
@@ -104,12 +148,15 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                                 tuple(chunk_pages),
                                 len(req.input_ids),
                             )
-                            ring.put(slot, raw)
+                            if args.disaggregation_transfer_backend == "queue":
+                                payload = raw
+                            else:
+                                ring.put(slot, raw)
+                                payload = (slot, len(raw))
                             transfers.append(
                                 (
                                     uid,
-                                    slot,
-                                    len(raw),
+                                    payload,
                                     meta.pack(),
                                     req.input_ids,
                                     req.sampling_params,
@@ -120,6 +167,12 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                         scheduler.release_request(uid)
                         break
                 results.put((role, "STEP", outputs, transfers))
+                # logger.info(
+                #     "PD worker role=%s finished STEP outputs=%d transfers=%d",
+                #     role,
+                #     len(outputs),
+                #     len(transfers),
+                # )
             elif cmd.name == "SHUTDOWN":
                 break
     except BaseException as exc:
@@ -157,7 +210,11 @@ class PDSchedulerProxy:
             * model_args.head_dim
             * element_size
         )
-        self._ring = ShmRing(ring_size, args.disaggregation_shm_slot_count)
+        self._ring = (
+            None
+            if args.disaggregation_transfer_backend == "queue"
+            else ShmRing(ring_size, args.disaggregation_shm_slot_count)
+        )
         self._workers = [
             self._ctx.Process(
                 target=_worker,
@@ -168,7 +225,7 @@ class PDSchedulerProxy:
                     self._commands[i],
                     self._results,
                     self._errors,
-                    self._ring.name,
+                    self._ring.name if self._ring is not None else None,
                     ring_size,
                 ),
             )
@@ -204,6 +261,19 @@ class PDSchedulerProxy:
             self.cleanup()
             raise RuntimeError("PD worker exited unexpectedly")
 
+    def _get_result(self, timeout: float):
+        """Wait for a protocol result while surfacing worker failures promptly."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._check_workers()
+                raise TimeoutError("timed out waiting for PD worker result")
+            try:
+                return self._results.get(timeout=min(0.1, remaining))
+            except queue.Empty:
+                self._check_workers()
+
     def add_request(self, input_ids: list[int], sampling_params: SamplingParams) -> int:
         uid = self._next_uid
         self._next_uid += 1
@@ -221,23 +291,36 @@ class PDSchedulerProxy:
 
     def step(self) -> list[OutputToken]:
         self._commands[0].put(_Command("STEP"))
-        _, state, outputs, transfers = self._results.get(timeout=self.args.pd_timeout)
+        _, state, outputs, transfers = self._get_result(self.args.pd_timeout)
         if state != "STEP":
             raise RuntimeError(f"unexpected PD message: {state}")
+        # A request can finish during prefill (for example with
+        # max_tokens=1). It has no decode KV transfer to wait for, so retire it
+        # from the coordinator immediately.
+        for output in outputs:
+            if output.finished:
+                self._active.discard(output.uid)
         for transfer in transfers:
-            uid, slot, length, meta, ids, sampling, offset, total_pages = transfer
+            uid, payload, meta, ids, sampling, offset, total_pages = transfer
             self._commands[1].put(
                 _Command(
                     "TRANSFER",
-                    (ids, sampling, uid, slot, length, meta, offset, total_pages),
+                    (ids, sampling, uid, payload, meta, offset, total_pages),
                 )
             )
-            self._results.get(timeout=self.args.pd_timeout)
+            role, state, transferred_uid = self._get_result(self.args.pd_timeout)
+            if role != "decode" or state != "TRANSFERRED" or transferred_uid != uid:
+                raise RuntimeError(
+                    "unexpected PD transfer result: "
+                    f"role={role} state={state} uid={transferred_uid} expected={uid}"
+                )
         if self._active and not transfers:
             self._commands[1].put(_Command("STEP"))
-            _, state, outputs, _ = self._results.get(timeout=self.args.pd_timeout)
-            if state != "STEP":
-                raise RuntimeError(f"unexpected PD message: {state}")
+            role, state, outputs, _ = self._get_result(self.args.pd_timeout)
+            if role != "decode" or state != "STEP":
+                raise RuntimeError(
+                    f"unexpected PD decode result: role={role} state={state}"
+                )
         for output in outputs:
             if output.finished:
                 self._active.discard(output.uid)
@@ -251,9 +334,22 @@ class PDSchedulerProxy:
             return
         self._closed = True
         for commands in self._commands:
-            commands.put(_Command("SHUTDOWN"))
+            with contextlib.suppress(Exception):
+                commands.put_nowait(_Command("SHUTDOWN"))
         for worker in self._workers:
-            worker.join(timeout=5)
+            # A worker can be blocked in model loading or CUDA allocation and
+            # therefore cannot consume SHUTDOWN. Keep failure cleanup short so
+            # the sibling worker cannot retain its model after the other one
+            # has failed during startup.
+            worker.join(timeout=1)
             if worker.is_alive():
                 worker.terminate()
-        self._ring.close(unlink=True)
+                worker.join(timeout=5)
+            if worker.is_alive():
+                # terminate() is cooperative on some platforms. A worker
+                # stuck inside CUDA allocation must not survive a failed PD
+                # startup and retain its model allocation.
+                worker.kill()
+                worker.join(timeout=5)
+        if self._ring is not None:
+            self._ring.close(unlink=True)

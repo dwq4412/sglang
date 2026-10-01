@@ -27,7 +27,7 @@ def parse_args() -> ServerArgs:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument(
         "--disaggregation-transfer-backend",
-        choices=["none", "shm", "shm_pinned"],
+        choices=["none", "queue", "shm", "shm_pinned"],
         default="none",
     )
     parser.add_argument("--pd-devices", type=int, nargs=2, default=(0, 1))

@@ -189,20 +189,43 @@ class Engine:
 
     def cleanup(self) -> None:
         """Release accelerator resources."""
-        if self.graph_runner is not None:
-            self.graph_runner.clear()
+        graph_runner = getattr(self, "graph_runner", None)
+        if graph_runner is not None:
+            graph_runner.clear()
+            # GraphRunner keeps references to Engine and _run_model. Break
+            # that cycle before dropping the model and runner below.
+            graph_runner.engine = None
+            graph_runner._run_model = None
+        self.graph_runner = None
         # The per-layer k_cache/v_cache references are views into the pool
         # buffer; drop them too or the pool's memory stays referenced and
         # cannot be released. The graph pad handle is released together with
         # the pool.
-        if hasattr(self, "model"):
-            for module in self.model.modules():
+        model = getattr(self, "model", None)
+        if model is not None:
+            for module in model.modules():
                 if isinstance(module, BaseAttention):
                     module.k_cache = None
                     module.v_cache = None
-        if hasattr(self, "kv_cache_pool"):
-            del self.kv_cache_pool
+            del model
+        self.kv_cache_pool = None
+
+        # ModelRunner owns another strong reference to the model and may own
+        # device-resident batch metadata. Detach every Engine-owned reference
+        # so the next benchmark iteration cannot inherit the previous model's
+        # weights through the runner.
+        runner = getattr(self, "runner", None)
+        if runner is not None:
+            runner.graph_runner = None
+            runner.model = None
+            runner.batch_context = None
+            del runner
+        self.runner = None
+        self.batch_context = None
+        self.model = None
         synchronize()
+        if getattr(self, "_device_type", None) == "cuda":
+            torch.cuda.empty_cache()
 
     def __del__(self) -> None:
         with contextlib.suppress(Exception):

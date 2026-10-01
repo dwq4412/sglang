@@ -83,7 +83,12 @@ class ServerArgs:
             )
         if self.tp_ar_chunk_bytes < 0:
             self.tp_ar_chunk_bytes = 0
-        if self.disaggregation_transfer_backend not in ("none", "shm", "shm_pinned"):
+        if self.disaggregation_transfer_backend not in (
+            "none",
+            "queue",
+            "shm",
+            "shm_pinned",
+        ):
             raise ValueError("Unknown disaggregation transfer backend")
         if self.disaggregation_transfer_backend != "none":
             if self.tp_size != 1 or self.device not in ("auto", "cuda", "cpu"):
