@@ -88,6 +88,7 @@ class ServerArgs:
             "queue",
             "shm",
             "shm_pinned",
+            "nixl",
         ):
             raise ValueError("Unknown disaggregation transfer backend")
         if self.disaggregation_transfer_backend != "none":
@@ -101,6 +102,8 @@ class ServerArgs:
                 or min(self.pd_devices) < 0
             ):
                 raise ValueError("PD requires two distinct nonnegative GPU indices")
+            if self.disaggregation_transfer_backend == "nixl" and self.device == "cpu":
+                raise ValueError("NIXL UCX backend requires CUDA")
             if (
                 min(
                     self.disaggregation_shm_slot_count,

@@ -189,10 +189,22 @@ def benchmark_backend(
     from minisgl.engine.engine import Engine
     from minisgl.scheduler.scheduler import Scheduler
 
-    if backend not in ("none", "queue", "shm", "shm_pinned"):
+    if backend not in ("none", "queue", "shm", "shm_pinned", "nixl"):
         raise ValueError(f"unsupported backend: {backend}")
-    if backend == "shm_pinned" and not torch.cuda.is_available():
-        raise RuntimeError("shm_pinned requires CUDA")
+    if backend in ("shm_pinned", "nixl") and not torch.cuda.is_available():
+        raise RuntimeError(f"{backend} requires CUDA")
+    if backend == "nixl":
+        import sys
+
+        try:
+            import nixl._api  # noqa: F401
+        except ImportError:
+            raise RuntimeError(
+                "NIXL is not installed in the notebook interpreter "
+                f"{sys.executable}. Install the NIXL package with UCX support "
+                "in this environment, then verify with: "
+                "python -c \"import nixl._api\""
+            ) from None
     model_args = ModelArgs.from_pretrained(model_path)
     common = {
         "model_path": model_path,

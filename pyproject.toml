@@ -38,6 +38,7 @@ dependencies = [
 [project.optional-dependencies]
 moe = ["triton>=2.1"]
 flash-attn = ["flash-attn>=2.0"]
+nixl = ["nixl"]
 all = ["mini-sglang[moe,flash-attn]"]
 
 dev = [

@@ -1,4 +1,4 @@
-"""Minimal synchronous 1P1D runtime for the opt-in SHM backends."""
+"""Minimal synchronous 1P1D runtime for the opt-in transfer backends."""
 
 from __future__ import annotations
 
@@ -30,7 +30,8 @@ def _tensor_bytes(tensor: torch.Tensor) -> bytes:
 
 
 def _worker(role, args, model_args, commands, results, errors, ring_name, ring_size):
-    engine = ring = None
+    engine = ring = nixl = None
+    nixl_peer = None
     pending = {}
     try:
         device_index = args.pd_devices[role == "decode"]
@@ -60,13 +61,22 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
         )
         engine = Engine(worker_args, model_args, tp_rank=0)
         scheduler = Scheduler(worker_args, engine, cache_strategy="naive")
-        if args.disaggregation_transfer_backend != "queue":
+        if args.disaggregation_transfer_backend == "nixl":
+            from minisgl.disaggregation.nixl_backend import NixlEndpoint
+
+            nixl = NixlEndpoint(
+                engine.kv_cache_pool,
+                device_index,
+                args.pd_timeout,
+                agent_name=f"mini-sglang-{role}-{device_index}",
+            )
+        if args.disaggregation_transfer_backend in ("shm", "shm_pinned"):
             ring = ShmRing(
                 ring_size, args.disaggregation_shm_slot_count, ring_name, False
             )
         if args.disaggregation_transfer_backend == "shm_pinned":
             ring.register_cuda()
-        results.put((role, "READY"))
+        results.put((role, "READY", nixl.metadata() if nixl else None))
         # logger.info("PD worker role=%s READY", role)
         while True:
             cmd = commands.get()
@@ -75,28 +85,52 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                 scheduler.add_request(ids, sampling, uid=uid)
             elif cmd.name == "ABORT":
                 scheduler.abort_request(cmd.payload[0])
+            elif cmd.name == "PEER":
+                if nixl is None:
+                    raise RuntimeError("PEER is only valid for the NIXL backend")
+                nixl_peer = nixl.add_peer(cmd.payload[0])
+                results.put((role, "PEER", nixl_peer))
+            elif cmd.name == "RELEASE":
+                scheduler.release_request(cmd.payload[0])
             elif cmd.name == "TRANSFER":
                 ids, sampling, uid, payload, meta_bytes, offset, total_pages = (
                     cmd.payload
                 )
                 meta = TransferMeta.unpack(meta_bytes)
-                dtype = getattr(torch, meta.dtype.removeprefix("torch."))
-                if args.disaggregation_transfer_backend == "queue":
+                if args.disaggregation_transfer_backend == "nixl":
+                    if role != "decode" or nixl is None:
+                        raise RuntimeError("NIXL transfer must be received by decode")
+                    source_pages = list(payload)
+                    handle = pending.get(uid)
+                    if handle is None:
+                        handle = engine.kv_cache_pool.alloc(total_pages)
+                        pending[uid] = handle
+                    destination_pages = handle.page_ids[
+                        offset : offset + len(meta.page_ids)
+                    ]
+                    nixl.write(
+                        nixl_peer,
+                        nixl.remote_pages(nixl_peer, source_pages),
+                        nixl.pages(destination_pages),
+                    )
+                elif args.disaggregation_transfer_backend == "queue":
+                    dtype = getattr(torch, meta.dtype.removeprefix("torch."))
                     raw = payload
                 else:
+                    dtype = getattr(torch, meta.dtype.removeprefix("torch."))
                     slot, length = payload
-                    raw = ring.get(slot, length)
-                source = torch.frombuffer(
-                    bytearray(raw), dtype=dtype
-                ).reshape(meta.shape)
-                handle = pending.get(uid)
-                if handle is None:
-                    handle = engine.kv_cache_pool.alloc(total_pages)
-                    pending[uid] = handle
-                target = engine.kv_cache_pool.buffer[
-                    :, :, handle.page_ids[offset : offset + len(meta.page_ids)]
-                ]
-                target.copy_(source.to(device=target.device), non_blocking=False)
+                if args.disaggregation_transfer_backend != "nixl":
+                    source = torch.frombuffer(
+                        bytearray(raw), dtype=dtype
+                    ).reshape(meta.shape)
+                    handle = pending.get(uid)
+                    if handle is None:
+                        handle = engine.kv_cache_pool.alloc(total_pages)
+                        pending[uid] = handle
+                    target = engine.kv_cache_pool.buffer[
+                        :, :, handle.page_ids[offset : offset + len(meta.page_ids)]
+                    ]
+                    target.copy_(source.to(device=target.device), non_blocking=False)
                 if offset + len(meta.page_ids) == total_pages:
                     scheduler.add_transferred_request(
                         ids, sampling, uid, handle.page_ids
@@ -148,7 +182,9 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                                 tuple(chunk_pages),
                                 len(req.input_ids),
                             )
-                            if args.disaggregation_transfer_backend == "queue":
+                            if args.disaggregation_transfer_backend == "nixl":
+                                payload = tuple(chunk_pages)
+                            elif args.disaggregation_transfer_backend == "queue":
                                 payload = raw
                             else:
                                 ring.put(slot, raw)
@@ -164,7 +200,8 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                                     len(pages),
                                 )
                             )
-                        scheduler.release_request(uid)
+                        if args.disaggregation_transfer_backend != "nixl":
+                            scheduler.release_request(uid)
                         break
                 results.put((role, "STEP", outputs, transfers))
                 # logger.info(
@@ -178,6 +215,9 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
     except BaseException as exc:
         errors.put((role, repr(exc)))
     finally:
+        if nixl is not None:
+            with contextlib.suppress(Exception):
+                nixl.cleanup()
         if ring is not None:
             ring.close()
         if engine is not None:
@@ -194,6 +234,7 @@ class PDSchedulerProxy:
         self._ctx = mp.get_context("spawn")
         self._commands = [self._ctx.Queue(), self._ctx.Queue()]
         self._results, self._errors = self._ctx.Queue(), self._ctx.Queue()
+        self._ready_metadata = {}
         self._active, self._next_uid, self._closed = set(), 0, False
         element_size = 2 if args.dtype in ("float16", "bfloat16") else 4
         chunk_pages = max(
@@ -211,9 +252,9 @@ class PDSchedulerProxy:
             * element_size
         )
         self._ring = (
-            None
-            if args.disaggregation_transfer_backend == "queue"
-            else ShmRing(ring_size, args.disaggregation_shm_slot_count)
+            ShmRing(ring_size, args.disaggregation_shm_slot_count)
+            if args.disaggregation_transfer_backend in ("shm", "shm_pinned")
+            else None
         )
         self._workers = [
             self._ctx.Process(
@@ -243,9 +284,22 @@ class PDSchedulerProxy:
                 self.cleanup()
                 raise TimeoutError("timed out starting PD workers")
             try:
-                role, state = self._results.get(timeout=0.1)
+                message = self._results.get(timeout=0.1)
+                role, state = message[:2]
                 if state == "READY":
                     ready.add(role)
+                    if self.args.disaggregation_transfer_backend == "nixl":
+                        self._ready_metadata[role] = message[2]
+                        if len(ready) == 2:
+                            for index, peer_role in enumerate(("prefill", "decode")):
+                                other = "decode" if peer_role == "prefill" else "prefill"
+                                self._commands[index].put(
+                                    _Command("PEER", (self._ready_metadata[other],))
+                                )
+                            for _ in range(2):
+                                peer_message = self._results.get(timeout=0.1)
+                                if peer_message[1] != "PEER":
+                                    raise RuntimeError("unexpected NIXL peer handshake")
             except queue.Empty:
                 self._check_workers()
 
@@ -314,6 +368,8 @@ class PDSchedulerProxy:
                     "unexpected PD transfer result: "
                     f"role={role} state={state} uid={transferred_uid} expected={uid}"
                 )
+            if self.args.disaggregation_transfer_backend == "nixl":
+                self._commands[0].put(_Command("RELEASE", (uid,)))
         if self._active and not transfers:
             self._commands[1].put(_Command("STEP"))
             role, state, outputs, _ = self._get_result(self.args.pd_timeout)
