@@ -87,7 +87,7 @@ class ServerArgs:
             "none",
             "queue",
             "shm",
-            "shm_pinned",
+            "hssm",
             "nixl",
         ):
             raise ValueError("Unknown disaggregation transfer backend")

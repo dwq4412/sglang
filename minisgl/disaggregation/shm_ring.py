@@ -51,7 +51,7 @@ class ShmRing:
         if self._registered:
             return
         if not torch.cuda.is_available():
-            raise RuntimeError("shm_pinned requires CUDA")
+            raise RuntimeError("hssm requires CUDA")
         address = ctypes.addressof(ctypes.c_char.from_buffer(self.shm.buf))
         result = torch.cuda.cudart().cudaHostRegister(address, self.shm.size, 0)
         if result != 0:

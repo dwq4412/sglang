@@ -1,9 +1,9 @@
-"""Notebook helpers for measuring the mini-sglang SHM/SHM-pinned backend.
+"""Notebook helpers for measuring the mini-sglang SHM/HSSM backend.
 
 This module intentionally keeps the notebook thin.  The CPU checks and the
 copy microbenchmark run without a model or CUDA.  The end-to-end benchmark
     uses the existing Scheduler for the baseline and PDSchedulerProxy for the
-    ``queue``/``shm``/``shm_pinned`` paths.
+    ``queue``/``shm``/``hssm`` paths.
 """
 
 from __future__ import annotations
@@ -120,7 +120,7 @@ def benchmark_copy(
     payload_sizes: tuple[int, ...] = (1 << 20, 4 << 20, 16 << 20),
     warmup: int = 3,
     repeat: int = 20,
-    pinned: bool = False,
+    page_locked_host_memory: bool = False,
 ) -> list[dict[str, Any]]:
     """Compare an ordinary host copy with the project's shared-memory copy.
 
@@ -134,7 +134,7 @@ def benchmark_copy(
         payload = bytes(size)
         ring = ShmRing(size, 2)
         try:
-            if pinned:
+            if page_locked_host_memory:
                 ring.register_cuda()
             for _ in range(warmup):
                 ring.put(0, payload)
@@ -155,7 +155,7 @@ def benchmark_copy(
             rows.append(
                 {
                     "bytes": size,
-                    "pinned": pinned,
+                    "page_locked_host_memory": page_locked_host_memory,
                     "shm_p50_ms": shm_p50,
                     "plain_p50_ms": plain_p50,
                     "shm_gib_per_s": size / shm_p50 / 1e6,
@@ -189,9 +189,9 @@ def benchmark_backend(
     from minisgl.engine.engine import Engine
     from minisgl.scheduler.scheduler import Scheduler
 
-    if backend not in ("none", "queue", "shm", "shm_pinned", "nixl"):
+    if backend not in ("none", "queue", "shm", "hssm", "nixl"):
         raise ValueError(f"unsupported backend: {backend}")
-    if backend in ("shm_pinned", "nixl") and not torch.cuda.is_available():
+    if backend in ("hssm", "nixl") and not torch.cuda.is_available():
         raise RuntimeError(f"{backend} requires CUDA")
     if backend == "nixl":
         import sys

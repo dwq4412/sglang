@@ -70,11 +70,11 @@ def _worker(role, args, model_args, commands, results, errors, ring_name, ring_s
                 args.pd_timeout,
                 agent_name=f"mini-sglang-{role}-{device_index}",
             )
-        if args.disaggregation_transfer_backend in ("shm", "shm_pinned"):
+        if args.disaggregation_transfer_backend in ("shm", "hssm"):
             ring = ShmRing(
                 ring_size, args.disaggregation_shm_slot_count, ring_name, False
             )
-        if args.disaggregation_transfer_backend == "shm_pinned":
+        if args.disaggregation_transfer_backend == "hssm":
             ring.register_cuda()
         results.put((role, "READY", nixl.metadata() if nixl else None))
         # logger.info("PD worker role=%s READY", role)
@@ -253,7 +253,7 @@ class PDSchedulerProxy:
         )
         self._ring = (
             ShmRing(ring_size, args.disaggregation_shm_slot_count)
-            if args.disaggregation_transfer_backend in ("shm", "shm_pinned")
+            if args.disaggregation_transfer_backend in ("shm", "hssm")
             else None
         )
         self._workers = [
